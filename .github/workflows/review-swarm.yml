@@ -1,0 +1,64 @@
+name: Code Review Swarm
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+    branches: [main]
+
+# Cancel previous runs for the same PR when a new commit is pushed
+concurrency:
+  group: review-swarm-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install OpenSandbox
+        run: |
+          pip install opensandbox opensandbox-mcp
+
+      - name: Start OpenSandbox server
+        run: |
+          OPENSANDBOX_INSECURE_SERVER=YES opensandbox-server --port 8080 &
+          echo "OPENSSANDBOX_PID=$!" >> $GITHUB_ENV
+          sleep 5
+
+      - name: Start OpenSandbox MCP server
+        run: |
+          OPENSANDBOX_INSECURE_SERVER=YES opensandbox-mcp \
+            --domain localhost:8080 --protocol http --transport streamable-http &
+          sleep 3
+
+      - name: Install Strands SDK + dependencies
+        run: |
+          cd agent
+          pip install -r requirements.txt
+
+      - name: Build sandbox image
+        run: |
+          docker build -t review-swarm-sandbox:latest -f sandbox/Dockerfile sandbox/
+
+      - name: Run code review swarm
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          cd agent
+          python main.py &
+          SWARM_PID=$!
+          sleep 5
+          curl -f -X POST localhost:8081/review \
+            -H 'Content-Type: application/json' \
+            -d '{
+              "repository": "${{ github.repository }}",
+              "pr_number": ${{ github.event.pull_request.number }}
+            }'
+          kill $SWARM_PID 2>/dev/null || true

@@ -1,0 +1,11 @@
+.idea
+.ipynb_checkpoints
+.mypy_cache
+.vscode
+.pytest_cache
+/.venv
+/**/__pycache__
+.goosehints
+
+# macOS
+.DS_Store
