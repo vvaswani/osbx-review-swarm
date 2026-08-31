@@ -1,34 +1,20 @@
-FROM python:3.11-slim
+FROM oven/bun:1.4-alpine
 
-# System packages: build tools, git, language runtimes, linters + PostgreSQL
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    git \
-    curl \
-    wget \
-    ca-certificates \
-    netcat-openbsd \
-    jq \
-    build-essential \
-    gcc \
-    g++ \
-    make \
-    cmake \
-    python3-dev \
-    libpq-dev \
-    postgresql \
-    postgresql-client \
-    nodejs \
-    npm \
-    golang-go \
-    openjdk-17-jdk \
-    && rm -rf /var/lib/apt/lists/*
+# System packages: build tools, git, polyglot runtimes + PostgreSQL
+RUN apk add --no-cache \
+    git curl jq \
+    build-base \
+    postgresql postgresql-contrib \
+    nodejs npm \
+    go \
+    openjdk17 \
+    python3 py3-pip
 
-# Python linters + security scanners
-RUN pip install --no-cache-dir ruff flake8 pylint bandit
+# TypeScript linters + formatters (global) — primary linters for TS app testing
+RUN bun add -g eslint prettier typescript@latest
 
-# Node linters + formatters
-RUN npm install -g eslint prettier
+# Python linters + security scanners — for polyglot code analysis inside sandboxes
+RUN pip3 install --no-cache-dir ruff flake8 bandit
 
-# Copy entrypoint
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh

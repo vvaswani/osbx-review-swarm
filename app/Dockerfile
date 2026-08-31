@@ -1,7 +1,14 @@
-FROM python:3.11
-RUN apt-get update && apt-get install -y libpq-dev
-COPY . /app
+FROM oven/bun:1.4-alpine
+
 WORKDIR /app
-RUN pip install -r requirements.txt
+
+# Install dependencies
+COPY package.json ./
+RUN bun install
+
+# Copy source
+COPY . .
+
 EXPOSE 8000
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--log-level", "trace"]
+
+CMD ["bun", "run", "src/main.ts"]

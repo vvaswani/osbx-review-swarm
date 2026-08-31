@@ -1,0 +1,24 @@
+# Node/Bun
+node_modules/
+bun.lockb
+bun.lock
+*.tsbuildinfo
+dist/
+
+# IDE
+.idea/
+.vscode/
+.ipynb_checkpoints
+.mypy_cache/
+.pytest_cache/
+
+# OS
+.DS_Store
+
+# Environment
+.env
+app/.env
+agent/.env
+
+# Agent
+.claude/

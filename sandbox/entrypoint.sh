@@ -1,8 +1,11 @@
 #!/bin/bash
 set -e
 
-# Resolve PostgreSQL bin directory
+# Resolve PostgreSQL bin directory (Alpine: /usr/bin, Debian: /usr/lib/postgresql/*/bin)
 PG_BIN=$(find /usr/lib/postgresql/*/bin -maxdepth 0 -type d 2>/dev/null | sort -V | tail -1)
+if [ -z "$PG_BIN" ]; then
+  PG_BIN="/usr/bin"
+fi
 export PATH="$PG_BIN:$PATH"
 
 # Initialize and start PostgreSQL (needed for repos with DB-dependent tests)
