@@ -38,12 +38,11 @@ config();
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN || process.env.GH_TOKEN;
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const MCP_URL = process.env.OPENSANDBOX_MCP_URL || 'http://localhost:8000/mcp';
-const GH_MARKER = '<!-- REVIEW_SWARM_COMMENT -->';
-const GH_GRAPHQL_URL = 'https://api.github.com/graphql';
-const GH_API_BASE = 'https://api.github.com';
+const GITHUB_MARKER = '<!-- REVIEW_SWARM_COMMENT -->';
+const GITHUB_GRAPHQL_URL = 'https://api.github.com/graphql';
+const GITHUB_API_BASE = 'https://api.github.com';
 
-// Mastra v1.63.0 supports OpenRouter magic strings: model: 'openrouter/provider/model'
-const MODEL = `openrouter/${process.env.OPENROUTER_MODEL || 'deepseek/deepseek-chat'}`;
+const MODEL = process.env.OPENROUTER_MODEL || 'openrouter/nvidia/nemotron-3.5-lightning:free';
 
 // ── GitHub Helpers (service layer — never inside agents) ──────────────────────
 
@@ -118,7 +117,7 @@ async function minimizeOldComments(repository: string, prNumber: number): Promis
   });
 
   for (const comment of comments) {
-    if (!comment.body?.includes(GH_MARKER)) continue;
+    if (!comment.body?.includes(GITHUB_MARKER)) continue;
 
     console.log(`Minimizing old comment id=${comment.id}`);
 
@@ -131,7 +130,7 @@ async function minimizeOldComments(repository: string, prNumber: number): Promis
       }
     `;
 
-    const response = await fetch(GH_GRAPHQL_URL, {
+    const response = await fetch(GITHUB_GRAPHQL_URL, {
       method: 'POST',
       headers: {
         Authorization: `bearer ${GITHUB_TOKEN}`,
@@ -167,7 +166,7 @@ async function postPrComment(repository: string, prNumber: number, body: string)
     owner,
     repo: repoName,
     issue_number: prNumber,
-    body: `${GH_MARKER}\n${body}`,
+    body: `${GITHUB_MARKER}\n${body}`,
   });
 
   console.log(`Posted comment: ${comment.html_url}`);
@@ -225,7 +224,7 @@ async function createFixBranchAndPr(
   };
 
   // 1. Resolve the PR head commit SHA
-  const branchResp = await fetch(`${GH_API_BASE}/repos/${repository}/branches/${prHeadRef}`, { headers });
+  const branchResp = await fetch(`${GITHUB_API_BASE}/repos/${repository}/branches/${prHeadRef}`, { headers });
   if (!branchResp.ok) {
     throw new Error(`Could not get base branch ref: ${await branchResp.text()}`);
   }
@@ -233,7 +232,7 @@ async function createFixBranchAndPr(
   const baseSha = branchData.commit.sha;
 
   // 2. Create the fix branch ref from the PR head
-  const refResp = await fetch(`${GH_API_BASE}/repos/${repository}/git/refs`, {
+  const refResp = await fetch(`${GITHUB_API_BASE}/repos/${repository}/git/refs`, {
     method: 'POST',
     headers,
     body: JSON.stringify({ ref: `refs/heads/${branch}`, sha: baseSha }),
@@ -251,14 +250,14 @@ async function createFixBranchAndPr(
     const encoded = Buffer.from(content).toString('base64');
 
     // Determine if file already exists on the new branch
-    const getResp = await fetch(`${GH_API_BASE}/repos/${repository}/contents/${filePath}?ref=${branch}`, { headers });
+    const getResp = await fetch(`${GITHUB_API_BASE}/repos/${repository}/contents/${filePath}?ref=${branch}`, { headers });
     let fileSha: string | undefined;
     if (getResp.ok) {
       const fileData = (await getResp.json()) as { sha?: string };
       fileSha = fileData.sha;
     }
 
-    const putResp = await fetch(`${GH_API_BASE}/repos/${repository}/contents/${filePath}`, {
+    const putResp = await fetch(`${GITHUB_API_BASE}/repos/${repository}/contents/${filePath}`, {
       method: 'PUT',
       headers,
       body: JSON.stringify({
