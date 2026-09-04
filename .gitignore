@@ -15,10 +15,9 @@ dist/
 # OS
 .DS_Store
 
-# Environment
-.env
-app/.env
-agent/.env
+# Environment - ignore all .env files anywhere in the repo
+**/.env
+**/.env.*
 
 # Agent
 .claude/
