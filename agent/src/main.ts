@@ -28,7 +28,6 @@ import { config } from 'dotenv';
 import {
   ConnectionConfig,
   Sandbox,
-  SandboxManager,
   type Execution,
   type RunCommandOpts,
 } from '@alibaba-group/opensandbox';
@@ -54,7 +53,6 @@ const OPENSANDBOX_API_KEY =
   process.env.OPEN_SANDBOX_API_KEY || process.env.OPENSANDBOX_API_KEY;
 const GITHUB_MARKER = '<!-- REVIEW_SWARM_COMMENT -->';
 const GITHUB_GRAPHQL_URL = 'https://api.github.com/graphql';
-const GITHUB_API_BASE = 'https://api.github.com';
 
 const MODEL = process.env.OPENROUTER_MODEL || 'openrouter/nvidia/nemotron-3.5-lightning:free';
 const SANDBOX_IMAGE = process.env.SANDBOX_IMAGE || 'review-swarm-sandbox:latest';
@@ -62,10 +60,14 @@ const SANDBOX_RESOURCE_LIMITS = { cpu: '1', memory: '2Gi' };
 const SANDBOX_TTL_SECONDS = 3600;
 
 /**
- * Track sandbox IDs created during this run so cleanup only destroys
+ * Track sandboxes created during this run so cleanup only destroys
  * sandboxes we created — never pre-existing ones.
+ * We store both the IDs (for filtering) and the Sandbox instances (for direct
+ * kill() calls that bypass the unreliable SandboxManager.listSandboxInfos listing
+ * step on SIGINT).
  */
 const createdSandboxIds = new Set<string>();
+const createdSandboxes: Sandbox[] = [];
 
 /**
  * Build a ConnectionConfig for the OpenSandbox SDK.
@@ -150,10 +152,18 @@ async function minimizeOldComments(repository: string, prNumber: number): Promis
     issue_number: prNumber,
   });
 
+  const matcherComments = comments.filter((c) => c.body?.includes(GITHUB_MARKER));
+  console.log(`Found ${comments.length} total comments, ${matcherComments.length} with the review-swarm marker`);
+
   for (const comment of comments) {
     if (!comment.body?.includes(GITHUB_MARKER)) continue;
 
-    console.log(`Minimizing old comment id=${comment.id}`);
+    if (!comment.node_id) {
+      console.warn(`Skipping comment id=${comment.id} — node_id is missing, cannot minimize`);
+      continue;
+    }
+
+    console.log(`Minimizing old comment id=${comment.id} node_id=${comment.node_id}`);
 
     const query = `
       mutation($input: MinimizeCommentInput!) {
@@ -193,13 +203,24 @@ async function minimizeOldComments(repository: string, prNumber: number): Promis
       data?: {
         minimizeComment?: {
           clientMutationId?: string;
-        };
+        } | null;
       };
       errors?: Array<{ message: string }>;
     };
     if (result.errors && result.errors.length > 0) {
       console.warn(
         `GraphQL minimize error: ${result.errors.map((e) => e.message).join(', ')}`,
+      );
+      continue;
+    }
+
+    // The mutation can return { data: { minimizeComment: null } } without
+    // an errors array — this means the minimize silently failed (e.g. the
+    // caller lacks permission, the node_id is invalid, etc.).
+    if (!result.data?.minimizeComment) {
+      console.warn(
+        `minimizeComment returned null for comment id=${comment.id} — ` +
+        `the comment was NOT minimized. Full response: ${JSON.stringify(result)}`,
       );
       continue;
     }
@@ -229,6 +250,8 @@ interface DeveloperOutput {
   diff: string;
   summary: string;
   branch?: string;
+  subPrUrl: string;
+  testResults: string;
 }
 
 /**
@@ -245,150 +268,94 @@ interface DeveloperOutput {
  * ```diff
  * ...
  * ```
+ *
+ * ## Test results
+ * ...
  */
 function parseDeveloperOutput(text: string): DeveloperOutput {
   const summaryMatch = text.match(/## Summary\s*\n([\s\S]*?)(?=\n##|\n```|$)/);
   const branchMatch = text.match(/## Branch\s*\n([\s\S]*?)(?=\n##|\n```|$)/);
   const diffMatch = text.match(/## Diff\s*\n```diff\s*\n([\s\S]*?)\n```/);
+  const testResultsMatch = text.match(/## Test results\s*\n([\s\S]*?)(?=\n##|$)/);
 
   return {
     summary: (summaryMatch?.[1] || '').trim(),
     branch: (branchMatch?.[1] || '').trim(),
     diff: (diffMatch?.[1] || '').trim(),
+    subPrUrl: '',
+    testResults: (testResultsMatch?.[1] || '').trim(),
   };
 }
 
 /**
- * Create a fix branch from the PR head, commit the diff file-by-file via the
- * GitHub Contents API, and open a sub-PR back to the PR's head branch.
+ * Commit changes in the sandbox via git and push to a new fix branch.
+ *
+ * Uses git commands directly in the sandbox — the same approach as the Python
+ * reference (osbx-self-healing-ci/agent/main.py:347-377) — rather than the
+ * GitHub Contents API, which can't handle deletions, renames, or binary files.
+ *
+ * Returns the fix branch name, or an empty string if there was nothing to commit.
+ */
+async function gitCommitAndPush(
+  sandbox: Sandbox,
+  repository: string,
+  fixBranch: string,
+  prNumber: number,
+): Promise<string> {
+  const pushUrl = `https://${GITHUB_TOKEN}@github.com/${repository}.git`;
+
+  const gitSteps: Array<[string, string]> = [
+    ['git-config-email', 'git config user.email "fixer-agent@example.com"'],
+    ['git-config-name', 'git config user.name "Fixer Agent"'],
+    [`git-checkout-${fixBranch}`, `git checkout -B ${fixBranch}`],
+    ['git-add', 'git add -A'],
+    ['git-commit', `git commit -m "fix: resolve issues in PR #${prNumber}"`],
+  ];
+
+  for (const [name, command] of gitSteps) {
+    const result = await runCommandInSandbox(sandbox, command, '/root/project');
+    // git commit returns exit code 1 when there's nothing to commit — that's OK
+    if (name === 'git-commit' && result.exit_code === 1) {
+      console.log('No changes to commit — skipping git push and sub-PR creation');
+      return '';
+    }
+    if (result.exit_code !== 0) {
+      throw new Error(`git step ${name} failed (exit ${result.exit_code}): ${result.stderr}`);
+    }
+  }
+
+  const pushResult = await runCommandInSandbox(
+    sandbox, `git push --force ${pushUrl} ${fixBranch}`, '/root/project'
+  );
+  if (pushResult.exit_code !== 0) {
+    throw new Error(`git push failed (exit ${pushResult.exit_code}): ${pushResult.stderr}`);
+  }
+
+  console.log(`Fix branch ${fixBranch} pushed to ${repository}`);
+  return fixBranch;
+}
+
+/**
+ * Open a sub-PR from the fix branch back to the PR's head branch.
+ * The fix branch was already committed and pushed by gitCommitAndPush.
  */
 async function createFixBranchAndPr(
   repository: string,
   prHeadRef: string,
-  diff: string,
+  fixBranch: string,
   summary: string,
-): Promise<{ branch: string; subPrUrl: string }> {
+): Promise<string> {
   const [owner, repoName] = parseRepo(repository);
-  const branch = `fix/review-swarm-${crypto.randomUUID().slice(0, 8)}`;
-  const headers: Record<string, string> = {
-    Authorization: `token ${GITHUB_TOKEN}`,
-    Accept: 'application/vnd.github+json',
-  };
-
-  // 1. Resolve the PR head commit SHA
-  const branchResp = await fetch(`${GITHUB_API_BASE}/repos/${repository}/branches/${prHeadRef}`, { headers });
-  if (!branchResp.ok) {
-    throw new Error(`Could not get base branch ref: ${await branchResp.text()}`);
-  }
-  const branchData = (await branchResp.json()) as { commit: { sha: string } };
-  const baseSha = branchData.commit.sha;
-
-  // 2. Create the fix branch ref from the PR head
-  const refResp = await fetch(`${GITHUB_API_BASE}/repos/${repository}/git/refs`, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify({ ref: `refs/heads/${branch}`, sha: baseSha }),
-  });
-  if (!refResp.ok) {
-    throw new Error(`Could not create branch ${branch}: ${await refResp.text()}`);
-  }
-
-  // 3. Parse the diff to extract per-file added content
-  const fileContents = parseDiffForNewFiles(diff);
-
-  if (Object.keys(fileContents).length === 0) {
-    console.log('No file changes in fix diff — skipping sub-PR creation');
-    return { branch, subPrUrl: '' };
-  }
-
-  // 4. Commit each file via the Contents API
-  for (const [filePath, lines] of Object.entries(fileContents)) {
-    const content = lines.join('\n');
-    const encoded = Buffer.from(content).toString('base64');
-
-    // Determine if file already exists on the new branch
-    const getResp = await fetch(`${GITHUB_API_BASE}/repos/${repository}/contents/${filePath}?ref=${branch}`, { headers });
-    let fileSha: string | undefined;
-    if (getResp.ok) {
-      const fileData = (await getResp.json()) as { sha?: string };
-      fileSha = fileData.sha;
-    }
-
-    const putResp = await fetch(`${GITHUB_API_BASE}/repos/${repository}/contents/${filePath}`, {
-      method: 'PUT',
-      headers,
-      body: JSON.stringify({
-        message: fileSha ? 'Update from review swarm' : 'Add from review swarm',
-        content: encoded,
-        sha: fileSha,
-        branch,
-      }),
-    });
-
-    if (!putResp.ok) {
-      console.warn(`Could not update ${filePath}: ${await putResp.text()}`);
-    }
-  }
-
-  // 5. Open a sub-PR
   const { data: newPr } = await octokit.rest.pulls.create({
     owner,
     repo: repoName,
     title: `fix: ${summary.slice(0, 80)}`,
-    head: branch,
+    head: fixBranch,
     base: prHeadRef,
-    body: `Automated fix generated by review swarm.\n\n${summary}\n\n\`\`\`diff\n${diff.slice(0, 3000)}\n\`\`\``,
+    body: `Automated fix generated by review swarm.\n\n${summary}`,
   });
-
   console.log(`Fix PR created: ${newPr.html_url}`);
-  return { branch, subPrUrl: newPr.html_url };
-}
-
-/**
- * Parse a unified diff to extract per-file content (added lines grouped by file).
- * Returns a map of file paths to arrays of content lines.
- */
-function parseDiffForNewFiles(diff: string): Record<string, string[]> {
-  const lines = diff.split('\n');
-  const result: Record<string, string[]> = {};
-  let currentFile: string | null = null;
-  let currentContent: string[] = [];
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-
-    if (line.startsWith('diff --git ')) {
-      if (currentFile && currentContent.length > 0) {
-        result[currentFile] = currentContent;
-      }
-      // Skip to the +++ line — may be preceded by an index line and --- line
-      while (i + 1 < lines.length && !lines[i + 1].startsWith('+++')) {
-        i++;
-      }
-      i++; // Move to the +++ line
-      if (i < lines.length && lines[i].startsWith('+++')) {
-        const match = lines[i].match(/\+\+\+ b\/(.+)/);
-        currentFile = match ? match[1].trim() : null;
-      }
-      currentContent = [];
-    } else if (currentFile) {
-      if (line.startsWith('+ ') || line.startsWith('+++') || line === '') {
-        if (line.startsWith('+ ')) {
-          currentContent.push(line.slice(2));
-        } else if (line.startsWith('+')) {
-          currentContent.push(line.slice(1));
-        } else {
-          currentContent.push(line);
-        }
-      }
-    }
-  }
-
-  if (currentFile && currentContent.length > 0) {
-    result[currentFile] = currentContent;
-  }
-
-  return result;
+  return newPr.html_url;
 }
 
 // ── Sandbox Cleanup ────────────────────────────────────────────────────────────
@@ -408,14 +375,17 @@ let signalExitCode: number | null = null;
 /**
  * Idempotent, single-flight sandbox cleanup.
  *
- * Lists sandboxes via the OpenSandbox JS SDK (SandboxManager) and kills each one
- * that was created during this run. This is the single point of sandbox
- * destruction — agents no longer call sandbox_kill themselves; each step's
- * sandbox is created by runReviewer/runDeveloper and killed here as a
- * safety-net.
+ * Kills each Sandbox instance created during this run by calling
+ * sandbox.kill() directly. This is the single point of sandbox destruction —
+ * agents no longer call sandbox_kill themselves; each step's sandbox is
+ * created by runReviewer/runDeveloper and killed here as a safety-net.
  *
- * If the server is unreachable (e.g. already shutting down from SIGINT),
- * cleanup logs a warning and returns — it never throws.
+ * We call sandbox.kill() directly on each instance rather than using
+ * SandboxManager.listSandboxInfos (which can fail on SIGINT when the listing
+ * step returns incomplete results). The stored Sandbox instances carry their
+ * own connection state, so direct kill() is reliable even during shutdown.
+ *
+ * Individual kill failures are logged as warnings — cleanup never throws.
  *
  * Concurrent calls share the same Promise so cleanup runs at most once.
  */
@@ -427,53 +397,34 @@ async function cleanupSandboxes(): Promise<void> {
   cleanupPromise = (async () => {
     console.log('Cleaning up sandboxes...');
 
-    try {
-      const connectionConfig = createConnectionConfig();
-      const manager = SandboxManager.create({ connectionConfig });
-
-      // 1. List all sandboxes
-      let items: Array<{ id: string }> = [];
-      try {
-        const response = await manager.listSandboxInfos({});
-        items = response.items || [];
-      } catch (e: any) {
-        console.warn('Sandbox cleanup (best-effort) failed:', e);
-        await manager.close();
-        return;
-      }
-
-      const sandboxes = items;
-      // Only delete sandboxes that were created during this run.
-      const toDelete = sandboxes.filter((sb) => sb.id && createdSandboxIds.has(sb.id));
-      if (toDelete.length === 0) {
-        console.log('No sandboxes to clean up');
-        await manager.close();
-        return;
-      }
-
-      console.log(`Found ${toDelete.length} sandbox(es) to clean up (of ${sandboxes.length} total on the server)`);
-
-      // Delete each sandbox created in this run (continue on individual failures)
-      let cleaned = 0;
-      for (const sb of toDelete) {
-        const id = sb.id;
-        console.log(`Deleting sandbox ${id}`);
-        try {
-          await manager.killSandbox(id);
-          console.log(`Deleted sandbox ${id}`);
-          cleaned++;
-        } catch (e: any) {
-          console.warn(`Error deleting sandbox ${id}:`, e);
-        } finally {
-          createdSandboxIds.delete(id);
-        }
-      }
-
-      console.log(`Sandbox cleanup complete (${cleaned}/${toDelete.length} deleted)`);
-      await manager.close();
-    } catch (e: any) {
-      console.warn('Sandbox cleanup encountered an unexpected error:', e);
+    // Take ownership of the sandbox instances created during this run.
+    // We call sandbox.kill() directly on each instance — this bypasses
+    // SandboxManager.listSandboxInfos which can fail on SIGINT (the listing
+    // step may not return results when the workflow is being aborted).
+    const toKill = createdSandboxes.splice(0); // atomically take all, clear the array
+    if (toKill.length === 0) {
+      console.log('No sandboxes to clean up');
+      return;
     }
+
+    console.log(`Found ${toKill.length} sandbox(es) to clean up`);
+
+    let cleaned = 0;
+    for (const sandbox of toKill) {
+      const id = sandbox.id;
+      console.log(`Deleting sandbox ${id}`);
+      try {
+        await sandbox.kill();
+        console.log(`Deleted sandbox ${id}`);
+        cleaned++;
+      } catch (e: any) {
+        console.warn(`Error deleting sandbox ${id}:`, e);
+      } finally {
+        createdSandboxIds.delete(id);
+      }
+    }
+
+    console.log(`Sandbox cleanup complete (${cleaned}/${toKill.length} deleted)`);
   })();
 
   return cleanupPromise;
@@ -482,9 +433,8 @@ async function cleanupSandboxes(): Promise<void> {
 /**
  * Create a sandbox via the OpenSandbox JS SDK and wait until it is ready.
  * The returned Sandbox instance is used by the service layer for commands;
- * its ID is also injected into the agent task string so the agent can call
- * command_run with connect_if_missing=True — it never needs to call
- * sandbox_create itself.
+ * its ID is also injected into the agent task string. The agent never needs to
+ * call sandbox_create itself.
  *
  * Sandbox.create() internally waits for the sandbox to reach Running state
  * and passes the health check, so no manual polling is needed.
@@ -496,10 +446,37 @@ async function createSandbox(): Promise<Sandbox> {
     image: SANDBOX_IMAGE,
     resource: SANDBOX_RESOURCE_LIMITS,
     timeoutSeconds: SANDBOX_TTL_SECONDS,
+    env: {
+      DATABASE_URL:
+        process.env.DATABASE_URL ||
+        'postgresql://postgres:postgres@localhost:5432/postgres',
+    },
   });
   createdSandboxIds.add(sandbox.id);
+  createdSandboxes.push(sandbox);
   console.log(`[createSandbox] Sandbox ${sandbox.id} is ready (Running + healthy)`);
   return sandbox;
+}
+
+/**
+ * Start background services (e.g. PostgreSQL) by running the sandbox image's
+ * entrypoint script. The entrypoint ends with `wait` which would block the
+ * exec session indefinitely, so we background it with nohup.
+ */
+async function startSandboxServices(sandbox: Sandbox): Promise<void> {
+  console.log(`[startSandboxServices] Starting services via /entrypoint.sh in sandbox ${sandbox.id}...`);
+  const result = await runCommandInSandbox(
+    sandbox,
+    'nohup /entrypoint.sh > /tmp/entrypoint.log 2>&1 &',
+    '/',
+    120,
+  );
+  if (result.exit_code !== 0) {
+    console.warn(`[startSandboxServices] Entrypoint exited with code ${result.exit_code} — services may not have started`);
+  }
+  // Give services a moment to start (e.g., PostgreSQL needs a few seconds)
+  await new Promise((resolve) => setTimeout(resolve, 5000));
+  console.log(`[startSandboxServices] Services started in sandbox ${sandbox.id}`);
 }
 
 /**
@@ -541,6 +518,7 @@ async function setupSandbox(
   repository: string,
   headRef: string,
 ): Promise<void> {
+  await startSandboxServices(sandbox);
   console.log(`[setupSandbox] Cloning ${repository} into sandbox ${sandbox.id}...`);
 
   // 1. Clone the repo (working_directory "/" since /root/project doesn't exist yet)
@@ -584,9 +562,9 @@ async function setupSandbox(
  * Register a sandbox with the MCP server's local registry.
  *
  * When a sandbox is created via the SDK (Sandbox.create), the MCP server
- * doesn't know about it. MCP tools like `file_read` don't support
- * connect_if_missing, so they fail with "Sandbox not found in local
- * registry". Calling `sandbox_connect` once registers the sandbox so all
+ * doesn't know about it. MCP tools like `file_read` fail with
+ * "Sandbox not found in local registry" unless the sandbox is first
+ * registered. Calling `sandbox_connect` once registers the sandbox so all
  * subsequent MCP tool calls succeed.
  */
 interface ExecutableTool {
@@ -599,11 +577,16 @@ async function connectSandboxToMcp(tools: ToolsInput, sandboxId: string): Promis
   const toolKey = 'sandbox_sandbox_connect';
   const tool = (tools as Record<string, ExecutableTool>)[toolKey];
   if (!tool) {
-    console.warn(`[connectSandboxToMcp] MCP tool '${toolKey}' not available — agent MCP tools may fail`);
-    return;
+    throw new Error(
+      `[connectSandboxToMcp] MCP tool '${toolKey}' not available — ` +
+      `cannot register sandbox ${sandboxId} with MCP server`,
+    );
   }
   await tool.execute({ sandbox_id: sandboxId }, {});
-  console.log(`[connectSandboxToMcp] Registered sandbox ${sandboxId} with MCP server`);
+  console.log(
+    `[connectSandboxToMcp] Registered sandbox ${sandboxId} with MCP server — ` +
+    `${Object.keys(tools).length} tools available: ${Object.keys(tools).join(', ')}`,
+  );
 }
 
 // ── Comment Formatting (simple markdown templates) ────────────────────────────
@@ -626,8 +609,17 @@ function formatRefutedComment(findings: string): string {
 /**
  * Format the developer's changeset into a PR comment.
  */
-function formatChangesetComment(diff: string, branch: string, summary: string, subPrUrl: string): string {
-  return `### Fix Applied\n\n**Branch:** \`${branch}\`\n\n**Summary:** ${summary}\n\n#### Diff\n\`\`\`diff\n${diff.slice(0, 3000)}\n\`\`\`\n\n#### Sub-PR: ${subPrUrl}`;
+function formatChangesetComment(
+  diff: string,
+  branch: string,
+  summary: string,
+  subPrUrl: string,
+  testResults: string,
+): string {
+  const testSection = testResults
+    ? `\n\n#### Test Results\n\`\`\`\n${testResults.slice(0, 3000)}\n\`\`\``
+    : '';
+  return `### Fix Applied\n\n**Branch:** \`${branch}\`\n\n**Summary:** ${summary}\n\n#### Diff\n\`\`\`diff\n${diff.slice(0, 3000)}\n\`\`\`\n\n#### Sub-PR: ${subPrUrl}${testSection}`;
 }
 
 // ── Mastra Workflow ───────────────────────────────────────────────────────────
@@ -642,6 +634,16 @@ const InputSchema = z.object({
 const OutputSchema = z.object({ status: z.string() });
 
 const ReviewOutputSchema = z.object({ result: z.string() });
+
+const DevelopOutputSchema = z.object({
+  result: z.object({
+    diff: z.string(),
+    summary: z.string(),
+    branch: z.string().optional(),
+    subPrUrl: z.string(),
+    testResults: z.string(),
+  }),
+});
 
 /**
  * Combined output from all 3 parallel review steps.
@@ -721,7 +723,13 @@ async function runReviewer(instructions: string, task: string, repository: strin
  * injected into the task string. The cleanupSandboxes() safety-net handles
  * destruction — the agent never needs to call sandbox_create or sandbox_kill.
  */
-async function runDeveloper(instructions: string, task: string, repository: string, headRef: string): Promise<string> {
+async function runDeveloper(
+  instructions: string,
+  task: string,
+  repository: string,
+  headRef: string,
+  prNumber: number,
+): Promise<DeveloperOutput> {
   const mcp = createMcpClient();
   const sandbox = await createSandbox();
   const taskWithSandbox = `${task}\n\nSANDBOX_ID: ${sandbox.id}`;
@@ -738,7 +746,16 @@ async function runDeveloper(instructions: string, task: string, repository: stri
       console.log(`[runDeveloper] result.toolCalls: ${result.toolCalls?.length ?? 0}`);
       console.log(`[runDeveloper] result.finishReason: ${result.finishReason}`);
     }
-    return result.text;
+    const output = parseDeveloperOutput(result.text || '');
+
+    // Commit and push the fix via git in the sandbox, then create a sub-PR
+    const fixBranch = output.branch || `fix/review-swarm-${crypto.randomUUID().slice(0, 8)}`;
+    const pushedBranch = await gitCommitAndPush(sandbox, repository, fixBranch, prNumber);
+    if (pushedBranch) {
+      output.subPrUrl = await createFixBranchAndPr(repository, headRef, pushedBranch, output.summary);
+    }
+    console.log(`[runDeveloper] Fix applied in sandbox ${sandbox.id} — subPR: ${output.subPrUrl}`);
+    return output;
   } finally {
     await mcp.disconnect();
   }
@@ -818,17 +835,18 @@ const refuteStep = createStep({
 
 /**
  * Develop fix step: creates its own sandbox + MCPClient, implements fixes
- * for accepted findings, returns diff as markdown.
+ * for accepted findings, commits + pushes via git in the sandbox, and opens
+ * a sub-PR. Returns the structured developer output.
  */
 const developStep = createStep({
   id: 'develop_fix',
   inputSchema: ReviewOutputSchema,
-  outputSchema: ReviewOutputSchema,
+  outputSchema: DevelopOutputSchema,
   execute: async ({ getInitData, getStepResult }) => {
     const initData = getInitData<{ repository: string; prNumber: number; task: string; headRef: string }>();
     const refuted = getStepResult<{ result: string }>('refute_findings');
     const task = `${initData.task}\n\n## Refuted Findings\n\n${refuted.result}`;
-    const result = await runDeveloper(DEVELOPER_INSTRUCTION, task, initData.repository, initData.headRef);
+    const result = await runDeveloper(DEVELOPER_INSTRUCTION, task, initData.repository, initData.headRef, initData.prNumber);
     return { result };
   },
 });
@@ -918,10 +936,44 @@ async function handleStepCompletion(
   debug: boolean,
 ): Promise<void> {
   const stepId = event.payload?.id;
-  const findings = extractStepResultText(event);
 
   if (debug) {
     console.log(`Step finished: ${stepId}`);
+  }
+
+  if (!stepId) {
+    console.error('handleStepCompletion: event.payload.id is missing — skipping.');
+    return;
+  }
+
+  // develop_fix has structured output (DeveloperOutput), not text findings.
+  // Handle it separately before the text-based extraction below.
+  if (stepId === 'develop_fix') {
+    const dev = event.payload?.output?.result as DeveloperOutput | undefined;
+    if (!dev || !dev.summary) {
+      console.error(
+        `handleStepCompletion: step '${stepId}' completed successfully but ` +
+        `no developer output was extracted. Skipping comment to avoid a header-only post.`,
+      );
+      if (debug) {
+        console.log(`  event.payload.output:`, JSON.stringify(event.payload?.output));
+      }
+      return;
+    }
+    if (debug) {
+      console.log(`  Developer output: diff=${dev.diff.length} chars, summary=${dev.summary.length} chars, testResults=${dev.testResults.length} chars, subPrUrl=${dev.subPrUrl}`);
+    }
+    await postPrComment(
+      repository,
+      prNumber,
+      formatChangesetComment(dev.diff, dev.branch || '', dev.summary, dev.subPrUrl, dev.testResults),
+    );
+    return;
+  }
+
+  const findings = extractStepResultText(event);
+
+  if (debug) {
     if (!findings || findings.trim() === '') {
       console.log(`  [WARN] No findings text extracted for step '${stepId}'.`);
       console.log(`  event.payload.output:`, JSON.stringify(event.payload?.output));
@@ -929,11 +981,6 @@ async function handleStepCompletion(
     } else {
       console.log(`  Findings length: ${findings.length} chars`);
     }
-  }
-
-  if (!stepId) {
-    console.error('handleStepCompletion: event.payload.id is missing — skipping.');
-    return;
   }
 
   if (!findings || findings.trim() === '') {
@@ -952,19 +999,6 @@ async function handleStepCompletion(
     await postPrComment(repository, prNumber, formatReviewerComment(findings, 'Code Quality Review'));
   } else if (stepId === 'refute_findings') {
     await postPrComment(repository, prNumber, formatRefutedComment(findings));
-  } else if (stepId === 'develop_fix') {
-    const { diff, summary } = parseDeveloperOutput(findings);
-    const { branch: actualBranch, subPrUrl } = await createFixBranchAndPr(
-      repository,
-      ctx.headRef,
-      diff,
-      summary,
-    );
-    await postPrComment(
-      repository,
-      prNumber,
-      formatChangesetComment(diff, actualBranch, summary, subPrUrl),
-    );
   }
 }
 
@@ -1031,7 +1065,7 @@ async function main() {
     ? ctx.changedFiles.map((f) => `- \`${f}\``).join('\n')
     : '*No code files changed*';
 
-  const diffPreview = ctx.diff ? ctx.diff.slice(0, 6000) : '*No diff available*';
+  //const diffPreview = ctx.diff ? ctx.diff.slice(0, 6000) : '*No diff available*';
 
   // Build the task string — just PR context. Agent instructions come from
   // prompts.ts (SECURITY_INSTRUCTION, PERFORMANCE_INSTRUCTION, etc.).
@@ -1050,11 +1084,7 @@ ${ctx.body || '(no description)'}
 
 Changed files:
 ${changedFilesStr}
-
-PR diff:
-\`\`\`diff
-${diffPreview}
-\`\`\`;`;
+`;
 
   // 4. Run the Mastra workflow with streaming
   try {

@@ -11,25 +11,13 @@
 // ── Shared sandbox lifecycle instructions ─────────────────────────────────
 
 export const SANDBOX_INSTRUCTIONS = `
-You have access to sandboxed tools (command_run, file_read, file_write,
-file_search, file_delete, file_move, file_replace_contents, file_create_directories,
-file_delete_directories, sandbox_get_endpoint, sandbox_get_info) connected to an
-OpenSandbox MCP server.
+You are an expert TypeScript developer.
 
-A sandbox has already been created and set up for you by the workflow engine.
-Its ID is provided in the task instructions as "SANDBOX_ID: <id>". Use this
-sandbox_id for all tool calls that require it (e.g. command_run). When using
-command_run, set connect_if_missing=True so the MCP server automatically connects
-to the pre-created sandbox.
+You have access to a sandboxed environment with tools to read/write files and run commands. Your sandbox ID is specified below - use this for all operations against the MCP server.
 
-The repository is already cloned at /root/project and the PR head is checked
-out. Dependencies are already installed under /root/project/app.
+Within the sandbox, the repository is checked out at /root/project; the application code under test lives in /root/project/app.
 
-Your job: read files, run linters/tests for evidence, and analyze the code
-(app code is in /root/project/app). Then return your findings as markdown text.
-
-Sandbox cleanup is handled automatically by the service after your step completes.
-You do not need to manage sandbox lifecycle.
+Sandbox cleanup is handled automatically after your step completes. You do not need to manage sandbox lifecycle.
 `;
 
 // ── Reviewer prompts ──────────────────────────────────────────────────────
@@ -174,4 +162,7 @@ fix/review-swarm-xxxxxxxx
 \`\`\`diff
 [your diff here]
 \`\`\`
+
+## Test results
+[test results here]
 `;
