@@ -305,6 +305,10 @@ async function gitCommitAndPush(
 ): Promise<string> {
   const pushUrl = `https://${GITHUB_TOKEN}@github.com/${repository}.git`;
 
+  // Log git status so we can diagnose "no changes to commit" issues
+  const statusResult = await runCommandInSandbox(sandbox, 'git status --short', '/root/project');
+  console.log(`[gitCommitAndPush] git status:\n${statusResult.stdout || '(clean)'}`);
+
   const gitSteps: Array<[string, string]> = [
     ['git-config-email', 'git config user.email "fixer-agent@example.com"'],
     ['git-config-name', 'git config user.name "Fixer Agent"'],
@@ -374,6 +378,13 @@ let cleanupPromise: Promise<void> | null = null;
 let signalExitCode: number | null = null;
 
 /**
+ * Set by main() when --limiter is passed. Controls whether agent.generate()
+ * calls are rate-limited to 1 request per 3 seconds (to stay within OpenRouter
+ * free-tier limits).
+ */
+let useLimiter = false;
+
+/**
  * Promise that rejects after `ms` milliseconds — used to race against
  * operations that can hang during SIGINT/SIGTERM (e.g. HTTP DELETE to a
  * shutting-down OpenSandbox server).
@@ -382,6 +393,74 @@ function timeout(ms: number): Promise<never> {
   return new Promise((_, reject) =>
     setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms),
   );
+}
+
+/**
+ * Simple in-process rate limiter for OpenRouter model calls.
+ * Enforces ~1 request every 3 seconds (20 req/min) to stay within free-tier limits.
+ * Concurrent requests are queued and executed sequentially with the interval enforced.
+ * When disabled (no --limiter flag), agent.generate() calls bypass the limiter entirely.
+ */
+class RateLimiter {
+  private queue: Array<{
+    fn: () => Promise<unknown>;
+    resolve: (v: unknown) => void;
+    reject: (e: unknown) => void;
+  }> = [];
+  private isProcessing = false;
+  private lastRequestTime = 0;
+  private readonly minIntervalMs = 3000;
+
+  async add<T>(fn: () => Promise<T>): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      this.queue.push({
+        fn: fn as () => Promise<unknown>,
+        resolve: resolve as (v: unknown) => void,
+        reject: reject as (e: unknown) => void,
+      });
+      this.process();
+    });
+  }
+
+  private async process(): Promise<void> {
+    if (this.isProcessing) return;
+    this.isProcessing = true;
+    try {
+      while (this.queue.length > 0) {
+        const { fn, resolve, reject } = this.queue.shift()!;
+        // Enforce minimum interval between requests
+        const now = Date.now();
+        const elapsed = now - this.lastRequestTime;
+        if (elapsed < this.minIntervalMs) {
+          await new Promise((r) => setTimeout(r, this.minIntervalMs - elapsed));
+        }
+        this.lastRequestTime = Date.now();
+        try {
+          const result = await fn();
+          resolve(result);
+        } catch (e) {
+          reject(e);
+        }
+      }
+    } finally {
+      this.isProcessing = false;
+    }
+  }
+}
+
+const rateLimiter = new RateLimiter();
+
+/**
+ * Call agent.generate() through the rate limiter when useLimiter is set.
+ * Without the limiter, calls proceed normally (concurrent).
+ */
+function generateWithLimit(
+  agent: Agent,
+  prompt: string,
+  opts?: { maxSteps?: number },
+): Promise<any> {
+  const call = () => (opts ? agent.generate(prompt, opts) : agent.generate(prompt));
+  return useLimiter ? rateLimiter.add(call) : call();
 }
 
 /**
@@ -611,14 +690,81 @@ async function connectSandboxToMcp(tools: ToolsInput, sandboxId: string): Promis
   );
 }
 
-// ── Comment Formatting (simple markdown templates) ────────────────────────────
+// ── Comment Formatting ───────────────────────────────────────────────────────────
 
 /**
- * Format a reviewer's markdown findings into a PR comment with a header emoji.
- * The agent already returns markdown with ## HIGH / ## MEDIUM / ## LOW sections.
+ * A single finding parsed from a reviewer agent's markdown output.
+ */
+interface ReviewFinding {
+  severity: 'HIGH' | 'MEDIUM' | 'LOW';
+  /** The raw finding text, e.g. `1. **title** — \`file:line\` — description — suggestion` */
+  rawText: string;
+}
+
+/**
+ * Parse markdown findings from a reviewer agent into a structured model.
+ *
+ * The agent returns findings organized by severity:
+ *   ## HIGH
+ *   1. **title** — `file:line` — description + suggestion
+ *   2. ...
+ *   ## MEDIUM
+ *   ...
+ *
+ * Falls back to a single uncategorized entry if no severity headers are found.
+ */
+function parseReviewerFindings(findings: string): ReviewFinding[] {
+  const result: ReviewFinding[] = [];
+  const lines = findings.split('\n');
+
+  let currentSeverity: 'HIGH' | 'MEDIUM' | 'LOW' | null = null;
+  for (const line of lines) {
+    const headerMatch = line.match(/^## (HIGH|MEDIUM|LOW)$/);
+    if (headerMatch) {
+      currentSeverity = headerMatch[1] as 'HIGH' | 'MEDIUM' | 'LOW';
+      continue;
+    }
+    // Finding lines start with a number + dot, e.g. "1. **title** — ..."
+    if (currentSeverity && line.match(/^\s*\d+\.\s/)) {
+      result.push({ severity: currentSeverity, rawText: line.trim() });
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Format a reviewer's markdown findings into a PR comment.
+ *
+ * Uses a consistent heading hierarchy: H1 (comment title) → H2 (Summary + severity
+ * sections). Findings are parsed from the agent's raw output into a structured model
+ * and re-rendered for consistent formatting.
  */
 function formatReviewerComment(findings: string, title: string): string {
-  return `# ${title}\n\n${findings}`;
+  const parsed = parseReviewerFindings(findings);
+
+  if (parsed.length === 0) {
+    // Fallback: wrap raw findings if parsing failed
+    return `# ${title}\n\n${findings}`;
+  }
+
+  const counts: Record<string, number> = { HIGH: 0, MEDIUM: 0, LOW: 0 };
+  for (const f of parsed) {
+    counts[f.severity]++;
+  }
+
+  const parts: string[] = [
+    `# ${title}`,
+    `## Summary\n${parsed.length} finding(s): ${counts.HIGH}H / ${counts.MEDIUM}M / ${counts.LOW}L`,
+  ];
+
+  for (const severity of ['HIGH', 'MEDIUM', 'LOW'] as const) {
+    const sectionFindings = parsed.filter((f) => f.severity === severity);
+    if (sectionFindings.length === 0) continue;
+    parts.push(`## ${severity}\n${sectionFindings.map((f) => f.rawText).join('\n')}`);
+  }
+
+  return parts.join('\n\n');
 }
 
 /**
@@ -726,7 +872,7 @@ async function runReviewer(instructions: string, task: string, repository: strin
     await connectSandboxToMcp(tools, sandbox.id);
     await setupSandbox(sandbox, repository, headRef);
     const agent = createAgent('reviewer', instructions, tools);
-    const result = await agent.generate(taskWithSandbox, { maxSteps: 15 });
+    const result = await generateWithLimit(agent, taskWithSandbox, { maxSteps: 50 });
     if (process.env.DEBUG_MCP) {
       console.log(`[runReviewer] result.text: ${JSON.stringify(result.text?.slice(0, 200))}`);
       console.log(`[runReviewer] result.steps.length: ${result.steps?.length ?? 'N/A'}`);
@@ -763,20 +909,24 @@ async function runDeveloper(
     await connectSandboxToMcp(tools, sandbox.id);
     await setupSandbox(sandbox, repository, headRef);
     const agent = createAgent('developer', instructions, tools);
-    const result = await agent.generate(taskWithSandbox, { maxSteps: 15 });
+    const result = await generateWithLimit(agent, taskWithSandbox, { maxSteps: 50 });
     // Always log key diagnostics — the developer's output is parsed structurally,
     // so empty/blocked output is a silent failure that must always surface.
-    console.log(`[runDeveloper] result.text length: ${result.text?.length ?? 0}`);
+    console.log(`[runDeveloper] result.text (first 500 chars): ${result.text?.slice(0, 500)}`);
     console.log(`[runDeveloper] result.finishReason: ${result.finishReason}`);
     console.log(`[runDeveloper] result.toolCalls: ${result.toolCalls?.length ?? 0}`);
     if (process.env.DEBUG_MCP) {
-      console.log(`[runDeveloper] result.text: ${JSON.stringify(result.text?.slice(0, 200))}`);
+      console.log(`[runDeveloper] result.text: ${JSON.stringify(result.text?.slice(0, 500))}`);
       console.log(`[runDeveloper] result.steps.length: ${result.steps?.length ?? 'N/A'}`);
       console.log(`[runDeveloper] result.toolResults: ${JSON.stringify(result.toolResults?.length ?? 0)}`);
     }
     const output = parseDeveloperOutput(result.text || '');
 
-    // Commit and push the fix via git in the sandbox, then create a sub-PR
+    // Commit and push the fix via git in the sandbox, then create a sub-PR.
+    // If the agent copied the literal placeholder (xxxxxxxx), generate a real branch name.
+    if (output.branch && output.branch.includes('xxxxxxxx')) {
+      output.branch = `fix/review-swarm-${crypto.randomUUID().slice(0, 8)}`;
+    }
     const fixBranch = output.branch || `fix/review-swarm-${crypto.randomUUID().slice(0, 8)}`;
     const pushedBranch = await gitCommitAndPush(sandbox, repository, fixBranch, prNumber);
     if (pushedBranch) {
@@ -856,7 +1006,7 @@ const refuteStep = createStep({
     ].join('\n\n');
 
     const agent = createAgent('refuter', REFUTER_INSTRUCTION);
-    const result = await agent.generate(combined);
+    const result = await generateWithLimit(agent, combined);
     return { result: result.text };
   },
 });
@@ -1035,10 +1185,11 @@ interface CliArgs {
   repository: string;
   prNumber: number;
   debug: boolean;
+  limiter: boolean;
 }
 
 function parseArgs(argv: string[]): CliArgs {
-  const args: CliArgs = { repository: '', prNumber: NaN, debug: false };
+  const args: CliArgs = { repository: '', prNumber: NaN, debug: false, limiter: false };
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -1050,6 +1201,8 @@ function parseArgs(argv: string[]): CliArgs {
       i++;
     } else if (arg === '--debug') {
       args.debug = true;
+    } else if (arg === '--limiter') {
+      args.limiter = true;
     }
   }
 
@@ -1079,6 +1232,8 @@ async function main() {
 
   console.log(`Starting code review swarm for ${args.repository} PR #${args.prNumber}`);
   if (args.debug) console.log(`Debug mode enabled. Model: ${MODEL}`);
+  useLimiter = args.limiter;
+  if (useLimiter) console.log(`Rate limiter enabled — 1 request per 3 seconds.`);
 
   // 1. Minimize old bot comments from previous runs
   await minimizeOldComments(args.repository, args.prNumber);

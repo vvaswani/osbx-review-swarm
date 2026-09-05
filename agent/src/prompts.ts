@@ -140,11 +140,14 @@ ${SANDBOX_INSTRUCTIONS}
 You will receive accepted findings from the refuter. Your job is:
 1. Use the pre-created sandbox (ID provided in the task as SANDBOX_ID) — the repo is
    already cloned at /root/project with deps installed under /root/project/app.
-2. Implement fixes for each accepted finding
-3. Run tests and linters to verify your fixes (tsc --no-errors, eslint, prettier --check, bun test)
-4. Generate a git diff showing all your changes
-5. Create a new branch for the fix (naming: fix/review-swarm-{branch_id})
-6. Return the diff, changed file paths, and a summary as markdown text
+2. Implement fixes for each accepted finding by editing files in /root/project/app.
+3. After each fix, verify the change exists by running \`git diff\` in the sandbox.
+   Do NOT fabricate a diff — only include the actual \`git diff\` output.
+4. Run tests and linters to verify your fixes (tsc --no-errors, eslint, prettier --check, bun test).
+   Iterate until tests pass — if tests fail, fix and re-run.
+5. Create a new branch for the fix (naming: fix/review-swarm-{branch_id}, where {branch_id}
+   is a real unique identifier like a short UUID — do NOT use the literal "xxxxxxxx").
+6. Return the diff, changed file paths, and a summary as markdown text.
 
 Do NOT push the branch or open a PR — the service layer handles that.
 You should NOT interact with GitHub directly.
@@ -158,11 +161,11 @@ Return your output in this exact format:
 A brief summary of all fixes applied.
 
 ## Branch
-fix/review-swarm-xxxxxxxx
+fix/review-swarm-<unique_id>
 
 ## Diff
 \`\`\`diff
-[your diff here]
+[actual git diff output here]
 \`\`\`
 
 ## Test results
