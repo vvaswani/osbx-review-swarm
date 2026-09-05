@@ -146,10 +146,11 @@ async function getPrContext(repository: string, prNumber: number): Promise<PrCon
 async function minimizeOldComments(repository: string, prNumber: number): Promise<void> {
   const [owner, repoName] = parseRepo(repository);
 
-  const { data: comments } = await octokit.rest.issues.listComments({
+  const comments = await octokit.paginate(octokit.rest.issues.listComments, {
     owner,
     repo: repoName,
     issue_number: prNumber,
+    per_page: 100,
   });
 
   const matcherComments = comments.filter((c) => c.body?.includes(GITHUB_MARKER));
@@ -596,14 +597,14 @@ async function connectSandboxToMcp(tools: ToolsInput, sandboxId: string): Promis
  * The agent already returns markdown with ## HIGH / ## MEDIUM / ## LOW sections.
  */
 function formatReviewerComment(findings: string, title: string): string {
-  return `### ${title}\n\n${findings}`;
+  return `# ${title}\n\n${findings}`;
 }
 
 /**
  * Format the refuter's output into a PR comment.
  */
 function formatRefutedComment(findings: string): string {
-  return `### Findings Summary\n\n${findings}`;
+  return `# Findings Summary\n\n${findings}`;
 }
 
 /**
@@ -740,11 +741,15 @@ async function runDeveloper(
     await setupSandbox(sandbox, repository, headRef);
     const agent = createAgent('developer', instructions, tools);
     const result = await agent.generate(taskWithSandbox, { maxSteps: 15 });
+    // Always log key diagnostics — the developer's output is parsed structurally,
+    // so empty/blocked output is a silent failure that must always surface.
+    console.log(`[runDeveloper] result.text length: ${result.text?.length ?? 0}`);
+    console.log(`[runDeveloper] result.finishReason: ${result.finishReason}`);
+    console.log(`[runDeveloper] result.toolCalls: ${result.toolCalls?.length ?? 0}`);
     if (process.env.DEBUG_MCP) {
       console.log(`[runDeveloper] result.text: ${JSON.stringify(result.text?.slice(0, 200))}`);
       console.log(`[runDeveloper] result.steps.length: ${result.steps?.length ?? 'N/A'}`);
-      console.log(`[runDeveloper] result.toolCalls: ${result.toolCalls?.length ?? 0}`);
-      console.log(`[runDeveloper] result.finishReason: ${result.finishReason}`);
+      console.log(`[runDeveloper] result.toolResults: ${JSON.stringify(result.toolResults?.length ?? 0)}`);
     }
     const output = parseDeveloperOutput(result.text || '');
 
