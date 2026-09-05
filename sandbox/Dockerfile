@@ -14,7 +14,9 @@ RUN apk add --no-cache \
 RUN bun add -g eslint prettier typescript@latest
 
 # Python linters + security scanners — for polyglot code analysis inside sandboxes
-RUN pip3 install --no-cache-dir ruff flake8 bandit
+# --break-system-packages: Alpine's Python is externally managed (PEP 668);
+# acceptable in this disposable container context
+RUN pip3 install --no-cache-dir --break-system-packages ruff flake8 bandit
 
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh

@@ -7,8 +7,11 @@
  * Implements a Mastra workflow:
  *   3 parallel review steps → refute_findings → develop_fix
  *
- * Each reviewer/developer creates its own MCPClient (sandbox isolation),
- * runs linters/tests in the sandbox, and returns markdown findings.
+ * Each reviewer/developer gets its own MCPClient + sandbox (created via the
+ * OpenSandbox JS SDK, registered with the MCP server via sandbox_connect,
+ * killed by the cleanupSandboxes safety-net). Agents never create or destroy
+ * sandboxes themselves — the sandbox_id is injected into their task string.
+ *
  * The refuter has no MCPClient — pure analysis of findings text.
  *
  * All GitHub API work (minimize old comments, post PR comments, create fix
@@ -22,6 +25,13 @@ import { MCPClient } from '@mastra/mcp';
 import { Octokit } from 'octokit';
 import { z } from 'zod';
 import { config } from 'dotenv';
+import {
+  ConnectionConfig,
+  Sandbox,
+  SandboxManager,
+  type Execution,
+  type RunCommandOpts,
+} from '@alibaba-group/opensandbox';
 
 import {
   SECURITY_INSTRUCTION,
@@ -38,11 +48,35 @@ config();
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN || process.env.GH_TOKEN;
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const MCP_URL = process.env.OPENSANDBOX_MCP_URL || 'http://localhost:8000/mcp';
+const OPENSANDBOX_API_URL =
+  process.env.OPENSANDBOX_API_URL || 'http://localhost:8080';
+const OPENSANDBOX_API_KEY =
+  process.env.OPEN_SANDBOX_API_KEY || process.env.OPENSANDBOX_API_KEY;
 const GITHUB_MARKER = '<!-- REVIEW_SWARM_COMMENT -->';
 const GITHUB_GRAPHQL_URL = 'https://api.github.com/graphql';
 const GITHUB_API_BASE = 'https://api.github.com';
 
 const MODEL = process.env.OPENROUTER_MODEL || 'openrouter/nvidia/nemotron-3.5-lightning:free';
+const SANDBOX_IMAGE = process.env.SANDBOX_IMAGE || 'review-swarm-sandbox:latest';
+const SANDBOX_RESOURCE_LIMITS = { cpu: '1', memory: '2Gi' };
+const SANDBOX_TTL_SECONDS = 3600;
+
+/**
+ * Track sandbox IDs created during this run so cleanup only destroys
+ * sandboxes we created — never pre-existing ones.
+ */
+const createdSandboxIds = new Set<string>();
+
+/**
+ * Build a ConnectionConfig for the OpenSandbox SDK.
+ * Reads the API URL/key from environment (same env vars the REST API code used).
+ */
+function createConnectionConfig(): ConnectionConfig {
+  return new ConnectionConfig({
+    domain: OPENSANDBOX_API_URL.replace(/^https?:\/\//, ''),
+    apiKey: OPENSANDBOX_API_KEY,
+  });
+}
 
 // ── GitHub Helpers (service layer — never inside agents) ──────────────────────
 
@@ -125,7 +159,6 @@ async function minimizeOldComments(repository: string, prNumber: number): Promis
       mutation($input: MinimizeCommentInput!) {
         minimizeComment(input: $input) {
           clientMutationId
-          minimizedComment { id }
         }
       }
     `;
@@ -141,7 +174,7 @@ async function minimizeOldComments(repository: string, prNumber: number): Promis
         query,
         variables: {
           input: {
-            subjectId: comment.id,
+            subjectId: comment.node_id,
             classifier: 'OUTDATED',
             clientMutationId: crypto.randomUUID(),
           },
@@ -152,7 +185,26 @@ async function minimizeOldComments(repository: string, prNumber: number): Promis
     if (!response.ok) {
       const text = await response.text();
       console.warn(`GraphQL minimize failed: ${response.status} ${text}`);
+      continue;
     }
+
+    // GitHub GraphQL returns 200 even when the mutation has errors.
+    const result = await response.json() as {
+      data?: {
+        minimizeComment?: {
+          clientMutationId?: string;
+        };
+      };
+      errors?: Array<{ message: string }>;
+    };
+    if (result.errors && result.errors.length > 0) {
+      console.warn(
+        `GraphQL minimize error: ${result.errors.map((e) => e.message).join(', ')}`,
+      );
+      continue;
+    }
+
+    console.log(`Minimized comment id=${comment.id}`);
   }
 }
 
@@ -244,6 +296,11 @@ async function createFixBranchAndPr(
   // 3. Parse the diff to extract per-file added content
   const fileContents = parseDiffForNewFiles(diff);
 
+  if (Object.keys(fileContents).length === 0) {
+    console.log('No file changes in fix diff — skipping sub-PR creation');
+    return { branch, subPrUrl: '' };
+  }
+
   // 4. Commit each file via the Contents API
   for (const [filePath, lines] of Object.entries(fileContents)) {
     const content = lines.join('\n');
@@ -304,8 +361,11 @@ function parseDiffForNewFiles(diff: string): Record<string, string[]> {
       if (currentFile && currentContent.length > 0) {
         result[currentFile] = currentContent;
       }
-      // Parse new file header (+++ b/path)
-      i++;
+      // Skip to the +++ line — may be preceded by an index line and --- line
+      while (i + 1 < lines.length && !lines[i + 1].startsWith('+++')) {
+        i++;
+      }
+      i++; // Move to the +++ line
       if (i < lines.length && lines[i].startsWith('+++')) {
         const match = lines[i].match(/\+\+\+ b\/(.+)/);
         currentFile = match ? match[1].trim() : null;
@@ -331,31 +391,219 @@ function parseDiffForNewFiles(diff: string): Record<string, string[]> {
   return result;
 }
 
+// ── Sandbox Cleanup ────────────────────────────────────────────────────────────
+
+// Module-level reference to the current Mastra workflow run.
+// The signal handler uses this to abort the workflow so it stops creating
+// new sandboxes while cleanup is in progress.
+let currentRunAbortController: AbortController | null = null;
+
+// Single-flight guard: the first caller starts the cleanup; concurrent callers
+// (signal handler, finally block, .catch) await the same Promise.
+let cleanupPromise: Promise<void> | null = null;
+
+// Exit code requested by a signal handler (130 = SIGINT, 143 = SIGTERM).
+let signalExitCode: number | null = null;
+
 /**
- * Safety-net: destroy any sandboxes that agents failed to clean up.
+ * Idempotent, single-flight sandbox cleanup.
+ *
+ * Lists sandboxes via the OpenSandbox JS SDK (SandboxManager) and kills each one
+ * that was created during this run. This is the single point of sandbox
+ * destruction — agents no longer call sandbox_kill themselves; each step's
+ * sandbox is created by runReviewer/runDeveloper and killed here as a
+ * safety-net.
+ *
+ * If the server is unreachable (e.g. already shutting down from SIGINT),
+ * cleanup logs a warning and returns — it never throws.
+ *
+ * Concurrent calls share the same Promise so cleanup runs at most once.
  */
-async function cleanupRemainingSandboxes(): Promise<void> {
-  const apiKey = process.env.OPENSANDBOX_API_KEY;
-  const headers: Record<string, string> = apiKey
-    ? { Authorization: `Bearer ${apiKey}` }
-    : {};
-
-  try {
-    const resp = await fetch('http://localhost:8080/sandboxes', { headers });
-    if (!resp.ok) return;
-
-    const data = (await resp.json()) as { sandboxes?: Array<{ id: string }> };
-    const sandboxes = data.sandboxes || [];
-    for (const sb of sandboxes) {
-      const id = sb.id;
-      if (id) {
-        console.log(`Cleaning up leftover sandbox ${id}`);
-        await fetch(`http://localhost:8080/sandboxes/${id}`, { method: 'DELETE', headers });
-      }
-    }
-  } catch (e) {
-    console.warn(`Sandbox cleanup (best-effort) failed: ${e}`);
+async function cleanupSandboxes(): Promise<void> {
+  if (cleanupPromise) {
+    return cleanupPromise; // already in progress — await the same operation
   }
+
+  cleanupPromise = (async () => {
+    console.log('Cleaning up sandboxes...');
+
+    try {
+      const connectionConfig = createConnectionConfig();
+      const manager = SandboxManager.create({ connectionConfig });
+
+      // 1. List all sandboxes
+      let items: Array<{ id: string }> = [];
+      try {
+        const response = await manager.listSandboxInfos({});
+        items = response.items || [];
+      } catch (e: any) {
+        console.warn('Sandbox cleanup (best-effort) failed:', e);
+        await manager.close();
+        return;
+      }
+
+      const sandboxes = items;
+      // Only delete sandboxes that were created during this run.
+      const toDelete = sandboxes.filter((sb) => sb.id && createdSandboxIds.has(sb.id));
+      if (toDelete.length === 0) {
+        console.log('No sandboxes to clean up');
+        await manager.close();
+        return;
+      }
+
+      console.log(`Found ${toDelete.length} sandbox(es) to clean up (of ${sandboxes.length} total on the server)`);
+
+      // Delete each sandbox created in this run (continue on individual failures)
+      let cleaned = 0;
+      for (const sb of toDelete) {
+        const id = sb.id;
+        console.log(`Deleting sandbox ${id}`);
+        try {
+          await manager.killSandbox(id);
+          console.log(`Deleted sandbox ${id}`);
+          cleaned++;
+        } catch (e: any) {
+          console.warn(`Error deleting sandbox ${id}:`, e);
+        } finally {
+          createdSandboxIds.delete(id);
+        }
+      }
+
+      console.log(`Sandbox cleanup complete (${cleaned}/${toDelete.length} deleted)`);
+      await manager.close();
+    } catch (e: any) {
+      console.warn('Sandbox cleanup encountered an unexpected error:', e);
+    }
+  })();
+
+  return cleanupPromise;
+}
+
+/**
+ * Create a sandbox via the OpenSandbox JS SDK and wait until it is ready.
+ * The returned Sandbox instance is used by the service layer for commands;
+ * its ID is also injected into the agent task string so the agent can call
+ * command_run with connect_if_missing=True — it never needs to call
+ * sandbox_create itself.
+ *
+ * Sandbox.create() internally waits for the sandbox to reach Running state
+ * and passes the health check, so no manual polling is needed.
+ */
+async function createSandbox(): Promise<Sandbox> {
+  const connectionConfig = createConnectionConfig();
+  const sandbox = await Sandbox.create({
+    connectionConfig,
+    image: SANDBOX_IMAGE,
+    resource: SANDBOX_RESOURCE_LIMITS,
+    timeoutSeconds: SANDBOX_TTL_SECONDS,
+  });
+  createdSandboxIds.add(sandbox.id);
+  console.log(`[createSandbox] Sandbox ${sandbox.id} is ready (Running + healthy)`);
+  return sandbox;
+}
+
+/**
+ * Set up a sandbox: clone the repo, checkout the PR head, and install deps.
+ * Runs inside the service layer so agents can start analyzing immediately.
+ */
+interface CommandRunResult {
+  exit_code: number | null;
+  stdout: string;
+  stderr: string;
+}
+
+/**
+ * Map an SDK Execution result to our simpler CommandRunResult.
+ */
+function executionResult(execution: Execution): CommandRunResult {
+  return {
+    exit_code: execution.exitCode ?? null,
+    stdout: (execution.logs?.stdout ?? []).map((m) => m.text).join(''),
+    stderr: (execution.logs?.stderr ?? []).map((m) => m.text).join(''),
+  };
+}
+
+async function runCommandInSandbox(
+  sandbox: Sandbox,
+  command: string,
+  workingDirectory?: string,
+  timeoutSeconds: number = 300,
+): Promise<CommandRunResult> {
+  const execution = await sandbox.commands.run(
+    command,
+    { workingDirectory, timeoutSeconds } as RunCommandOpts,
+  );
+  return executionResult(execution);
+}
+
+async function setupSandbox(
+  sandbox: Sandbox,
+  repository: string,
+  headRef: string,
+): Promise<void> {
+  console.log(`[setupSandbox] Cloning ${repository} into sandbox ${sandbox.id}...`);
+
+  // 1. Clone the repo (working_directory "/" since /root/project doesn't exist yet)
+  const cloneResult = await runCommandInSandbox(
+    sandbox,
+    `git clone https://github.com/${repository}.git /root/project`,
+    '/',
+  );
+  if (cloneResult.exit_code !== 0) {
+    throw new Error(
+      `Git clone failed (exit ${cloneResult.exit_code}): ${cloneResult.stderr || 'no stderr'}`,
+    );
+  }
+
+  // 2. Checkout the PR head
+  const checkoutResult = await runCommandInSandbox(
+    sandbox,
+    `git checkout ${headRef}`,
+    '/root/project',
+  );
+  if (checkoutResult.exit_code !== 0) {
+    throw new Error(
+      `Git checkout failed (exit ${checkoutResult.exit_code}): ${checkoutResult.stderr || 'no stderr'}`,
+    );
+  }
+
+  // 3. Install app dependencies if the app directory exists
+  const installResult = await runCommandInSandbox(
+    sandbox,
+    'cd /root/project/app && bun install 2>&1',
+    '/root/project/app',
+  );
+  if (installResult.exit_code !== 0) {
+    console.warn(`[setupSandbox] bun install exited with code ${installResult.exit_code} — continuing anyway`);
+  }
+
+  console.log(`[setupSandbox] Sandbox ${sandbox.id} is ready (clone + checkout + deps)`);
+}
+
+/**
+ * Register a sandbox with the MCP server's local registry.
+ *
+ * When a sandbox is created via the SDK (Sandbox.create), the MCP server
+ * doesn't know about it. MCP tools like `file_read` don't support
+ * connect_if_missing, so they fail with "Sandbox not found in local
+ * registry". Calling `sandbox_connect` once registers the sandbox so all
+ * subsequent MCP tool calls succeed.
+ */
+interface ExecutableTool {
+  execute: (input: any, context?: any) => Promise<any>;
+}
+
+async function connectSandboxToMcp(tools: ToolsInput, sandboxId: string): Promise<void> {
+  // Mastra MCPClient namespaces tools as `${serverName}_${toolName}`, so the
+  // MCP server's `sandbox_connect` tool becomes `sandbox_sandbox_connect`.
+  const toolKey = 'sandbox_sandbox_connect';
+  const tool = (tools as Record<string, ExecutableTool>)[toolKey];
+  if (!tool) {
+    console.warn(`[connectSandboxToMcp] MCP tool '${toolKey}' not available — agent MCP tools may fail`);
+    return;
+  }
+  await tool.execute({ sandbox_id: sandboxId }, {});
+  console.log(`[connectSandboxToMcp] Registered sandbox ${sandboxId} with MCP server`);
 }
 
 // ── Comment Formatting (simple markdown templates) ────────────────────────────
@@ -364,22 +612,22 @@ async function cleanupRemainingSandboxes(): Promise<void> {
  * Format a reviewer's markdown findings into a PR comment with a header emoji.
  * The agent already returns markdown with ## HIGH / ## MEDIUM / ## LOW sections.
  */
-function formatReviewerComment(findings: string, emoji: string, title: string): string {
-  return `### ${emoji} ${title}\n\n${findings}`;
+function formatReviewerComment(findings: string, title: string): string {
+  return `### ${title}\n\n${findings}`;
 }
 
 /**
  * Format the refuter's output into a PR comment.
  */
 function formatRefutedComment(findings: string): string {
-  return `### 🎯 Findings Summary\n\n${findings}`;
+  return `### Findings Summary\n\n${findings}`;
 }
 
 /**
  * Format the developer's changeset into a PR comment.
  */
 function formatChangesetComment(diff: string, branch: string, summary: string, subPrUrl: string): string {
-  return `### 💻 Fix Applied\n\n**Branch:** \`${branch}\`\n\n**Summary:** ${summary}\n\n#### Diff\n\`\`\`diff\n${diff.slice(0, 3000)}\n\`\`\`\n\n#### Sub-PR: ${subPrUrl}`;
+  return `### Fix Applied\n\n**Branch:** \`${branch}\`\n\n**Summary:** ${summary}\n\n#### Diff\n\`\`\`diff\n${diff.slice(0, 3000)}\n\`\`\`\n\n#### Sub-PR: ${subPrUrl}`;
 }
 
 // ── Mastra Workflow ───────────────────────────────────────────────────────────
@@ -387,6 +635,7 @@ function formatChangesetComment(diff: string, branch: string, summary: string, s
 const InputSchema = z.object({
   repository: z.string(),
   prNumber: z.number().int().positive(),
+  headRef: z.string(),
   task: z.string(),
 });
 
@@ -408,8 +657,9 @@ const ParallelReviewOutputSchema = z.object({
  * Create an MCPClient connected to the OpenSandbox MCP server.
  * Each reviewer/developer gets its own MCPClient for sandbox isolation.
  */
-function createMcpClient(): MCPClient {
+function createMcpClient(id: string = crypto.randomUUID()): MCPClient {
   return new MCPClient({
+    id,
     servers: {
       sandbox: {
         url: new URL(MCP_URL),
@@ -433,69 +683,107 @@ function createAgent(name: string, instructions: string, tools?: ToolsInput): Ag
 }
 
 /**
- * Run a review step: create MCPClient + Agent, get markdown findings, disconnect.
+ * Run a review step: create sandbox + MCPClient, set up repo, run agent, disconnect.
+ *
+ * The sandbox is created (via SDK) and set up (clone, checkout, deps) by the
+ * service layer. The agent receives the sandbox_id in the task string and only
+ * needs to analyze the code. cleanupSandboxes() handles destruction — the
+ * agent never creates or destroys sandboxes itself.
  */
-async function runReview(instructions: string, task: string): Promise<string> {
+async function runReviewer(instructions: string, task: string, repository: string, headRef: string): Promise<string> {
   const mcp = createMcpClient();
-  const tools = await mcp.listTools();
-  const agent = createAgent('reviewer', instructions, tools);
-  const result = await agent.generate(task);
-  await mcp.disconnect();
-  return result.text;
+  const sandbox = await createSandbox();
+  const taskWithSandbox = `${task}\n\nSANDBOX_ID: ${sandbox.id}`;
+  try {
+    const tools = await mcp.listTools();
+    console.log(`[runReviewer] Sandbox ${sandbox.id} connected to MCP server — available tools: ${Object.keys(tools).join(', ')}`);
+    await connectSandboxToMcp(tools, sandbox.id);
+    await setupSandbox(sandbox, repository, headRef);
+    const agent = createAgent('reviewer', instructions, tools);
+    const result = await agent.generate(taskWithSandbox, { maxSteps: 15 });
+    if (process.env.DEBUG_MCP) {
+      console.log(`[runReviewer] result.text: ${JSON.stringify(result.text?.slice(0, 200))}`);
+      console.log(`[runReviewer] result.steps.length: ${result.steps?.length ?? 'N/A'}`);
+      console.log(`[runReviewer] result.toolCalls: ${JSON.stringify(result.toolCalls?.length ?? 0)}`);
+      console.log(`[runReviewer] result.toolResults: ${JSON.stringify(result.toolResults?.length ?? 0)}`);
+      console.log(`[runReviewer] result.finishReason: ${result.finishReason}`);
+    }
+    return result.text;
+  } finally {
+    await mcp.disconnect();
+  }
 }
 
 /**
  * Run the developer step: create MCPClient + Agent, implement fixes, get diff.
+ *
+ * A sandbox is created (via SDK) before the agent runs and its ID is
+ * injected into the task string. The cleanupSandboxes() safety-net handles
+ * destruction — the agent never needs to call sandbox_create or sandbox_kill.
  */
-async function runDeveloper(instructions: string, task: string): Promise<string> {
+async function runDeveloper(instructions: string, task: string, repository: string, headRef: string): Promise<string> {
   const mcp = createMcpClient();
-  const tools = await mcp.listTools();
-  const agent = createAgent('developer', instructions, tools);
-  const result = await agent.generate(task);
-  await mcp.disconnect();
-  return result.text;
+  const sandbox = await createSandbox();
+  const taskWithSandbox = `${task}\n\nSANDBOX_ID: ${sandbox.id}`;
+  try {
+    const tools = await mcp.listTools();
+    console.log(`[runDeveloper] Sandbox ${sandbox.id} connected to MCP server — available tools: ${Object.keys(tools).join(', ')}`);
+    await connectSandboxToMcp(tools, sandbox.id);
+    await setupSandbox(sandbox, repository, headRef);
+    const agent = createAgent('developer', instructions, tools);
+    const result = await agent.generate(taskWithSandbox, { maxSteps: 15 });
+    if (process.env.DEBUG_MCP) {
+      console.log(`[runDeveloper] result.text: ${JSON.stringify(result.text?.slice(0, 200))}`);
+      console.log(`[runDeveloper] result.steps.length: ${result.steps?.length ?? 'N/A'}`);
+      console.log(`[runDeveloper] result.toolCalls: ${result.toolCalls?.length ?? 0}`);
+      console.log(`[runDeveloper] result.finishReason: ${result.finishReason}`);
+    }
+    return result.text;
+  } finally {
+    await mcp.disconnect();
+  }
 }
 
 // ── Step Definitions ───────────────────────────────────────────────────────────
 
 /**
- * Security review step: creates its own MCPClient (sandbox isolation),
- * clones repo, runs security linters, returns markdown findings.
+ * Security review step: creates its own sandbox + MCPClient, runs linters,
+ * reviews the diff for vulnerabilities, returns markdown findings.
  */
 const securityReviewStep = createStep({
   id: 'security_review',
   inputSchema: InputSchema,
   outputSchema: ReviewOutputSchema,
   execute: async ({ inputData }) => {
-    const result = await runReview(SECURITY_INSTRUCTION, inputData.task);
+    const result = await runReviewer(SECURITY_INSTRUCTION, inputData.task, inputData.repository, inputData.headRef);
     return { result };
   },
 });
 
 /**
- * Performance review step: creates its own MCPClient (sandbox isolation),
- * reviews for performance issues, returns markdown findings.
+ * Performance review step: creates its own sandbox + MCPClient, reviews for
+ * performance issues, returns markdown findings.
  */
 const performanceReviewStep = createStep({
   id: 'performance_review',
   inputSchema: InputSchema,
   outputSchema: ReviewOutputSchema,
   execute: async ({ inputData }) => {
-    const result = await runReview(PERFORMANCE_INSTRUCTION, inputData.task);
+    const result = await runReviewer(PERFORMANCE_INSTRUCTION, inputData.task, inputData.repository, inputData.headRef);
     return { result };
   },
 });
 
 /**
- * Code quality review step: creates its own MCPClient (sandbox isolation),
- * runs linters, reviews for code smells, returns markdown findings.
+ * Code quality review step: creates its own sandbox + MCPClient, runs linters,
+ * reviews for code smells, returns markdown findings.
  */
 const codeQualityReviewStep = createStep({
   id: 'code_quality_review',
   inputSchema: InputSchema,
   outputSchema: ReviewOutputSchema,
   execute: async ({ inputData }) => {
-    const result = await runReview(QUALITY_INSTRUCTION, inputData.task);
+    const result = await runReviewer(QUALITY_INSTRUCTION, inputData.task, inputData.repository, inputData.headRef);
     return { result };
   },
 });
@@ -529,18 +817,18 @@ const refuteStep = createStep({
 });
 
 /**
- * Develop fix step: creates its own MCPClient (sandbox isolation),
- * implements fixes for accepted findings, returns diff as markdown.
+ * Develop fix step: creates its own sandbox + MCPClient, implements fixes
+ * for accepted findings, returns diff as markdown.
  */
 const developStep = createStep({
   id: 'develop_fix',
   inputSchema: ReviewOutputSchema,
   outputSchema: ReviewOutputSchema,
   execute: async ({ getInitData, getStepResult }) => {
-    const initData = getInitData<{ repository: string; prNumber: number; task: string }>();
+    const initData = getInitData<{ repository: string; prNumber: number; task: string; headRef: string }>();
     const refuted = getStepResult<{ result: string }>('refute_findings');
     const task = `${initData.task}\n\n## Refuted Findings\n\n${refuted.result}`;
-    const result = await runDeveloper(DEVELOPER_INSTRUCTION, task);
+    const result = await runDeveloper(DEVELOPER_INSTRUCTION, task, initData.repository, initData.headRef);
     return { result };
   },
 });
@@ -554,18 +842,72 @@ const reviewSwarmWorkflow = new Workflow({
 })
   .parallel([securityReviewStep, performanceReviewStep, codeQualityReviewStep])
   .then(refuteStep)
-  .then(developStep);
+  .then(developStep)
+  .commit();
 
 // ── Event Handling ─────────────────────────────────────────────────────────────
 
+// Matches the `workflow-step-result` chunk type from
+// @mastra/core stream types (v1.63.0). The stream wrapper in
+// EventedRun.stream() additionally adds `stepName` to the payload.
 interface StepResultEvent {
   type: string;
-  payload?: {
+  runId: string;
+  from: string;
+  metadata?: Record<string, any>;
+  payload: {
     id: string;
-    stepCallId: string;
+    stepCallId?: string;
+    stepName?: string;
     status: string;
     output?: Record<string, any>;
+    payload?: Record<string, any>;
+    endedAt?: number;
+    startedAt?: number;
   };
+}
+
+/**
+ * Robustly extract the step result text from a `workflow-step-result` event.
+ *
+ * The step outputs (`{ result: "..." }`) are expected at `event.payload.output`,
+ * but we defensively try several possible locations so that a schema-shape
+ * mismatch never silently produces a header-only comment.
+ *
+ * Extraction order:
+ *   1. `payload.output.result` — the canonical shape for our steps
+ *   2. `payload.payload` — some Mastra internals nest the output under `payload`
+ *   3. `payload.output` as a bare string
+ *
+ * Returns `undefined` when no usable text is found.
+ */
+function extractStepResultText(event: StepResultEvent): string | undefined {
+  const payload = event.payload;
+
+  // 1. Canonical shape: { result: "..." }
+  const output = payload.output;
+  if (output && typeof output === 'object') {
+    const result = (output as Record<string, any>).result;
+    if (result !== undefined && result !== null) {
+      return typeof result === 'string' ? result : undefined;
+    }
+  }
+
+  // 2. Fallback: output nested under `payload.payload`
+  const innerPayload = payload.payload;
+  if (innerPayload && typeof innerPayload === 'object') {
+    const result = (innerPayload as Record<string, any>).result;
+    if (result !== undefined && result !== null) {
+      return typeof result === 'string' ? result : undefined;
+    }
+  }
+
+  // 3. Last resort: output itself is a string
+  if (typeof output === 'string') {
+    return output;
+  }
+
+  return undefined;
 }
 
 async function handleStepCompletion(
@@ -576,22 +918,42 @@ async function handleStepCompletion(
   debug: boolean,
 ): Promise<void> {
   const stepId = event.payload?.id;
-  const output = event.payload?.output as Record<string, any> | undefined;
+  const findings = extractStepResultText(event);
 
-  if (debug) console.log(`Step finished: ${stepId}`);
+  if (debug) {
+    console.log(`Step finished: ${stepId}`);
+    if (!findings || findings.trim() === '') {
+      console.log(`  [WARN] No findings text extracted for step '${stepId}'.`);
+      console.log(`  event.payload.output:`, JSON.stringify(event.payload?.output));
+      console.log(`  event.payload.payload:`, JSON.stringify(event.payload?.payload));
+    } else {
+      console.log(`  Findings length: ${findings.length} chars`);
+    }
+  }
 
-  if (!stepId || !output) return;
+  if (!stepId) {
+    console.error('handleStepCompletion: event.payload.id is missing — skipping.');
+    return;
+  }
+
+  if (!findings || findings.trim() === '') {
+    console.error(
+      `handleStepCompletion: step '${stepId}' completed successfully but ` +
+      `no findings text was extracted. Skipping comment to avoid a header-only post.`,
+    );
+    return;
+  }
 
   if (stepId === 'security_review') {
-    await postPrComment(repository, prNumber, formatReviewerComment(output.result, '🔒', 'Security Review'));
+    await postPrComment(repository, prNumber, formatReviewerComment(findings, 'Security Review'));
   } else if (stepId === 'performance_review') {
-    await postPrComment(repository, prNumber, formatReviewerComment(output.result, '⚡', 'Performance Review'));
+    await postPrComment(repository, prNumber, formatReviewerComment(findings, 'Performance Review'));
   } else if (stepId === 'code_quality_review') {
-    await postPrComment(repository, prNumber, formatReviewerComment(output.result, '🧹', 'Code Quality Review'));
+    await postPrComment(repository, prNumber, formatReviewerComment(findings, 'Code Quality Review'));
   } else if (stepId === 'refute_findings') {
-    await postPrComment(repository, prNumber, formatRefutedComment(output.result));
+    await postPrComment(repository, prNumber, formatRefutedComment(findings));
   } else if (stepId === 'develop_fix') {
-    const { diff, summary } = parseDeveloperOutput(output.result);
+    const { diff, summary } = parseDeveloperOutput(findings);
     const { branch: actualBranch, subPrUrl } = await createFixBranchAndPr(
       repository,
       ctx.headRef,
@@ -671,6 +1033,10 @@ async function main() {
 
   const diffPreview = ctx.diff ? ctx.diff.slice(0, 6000) : '*No diff available*';
 
+  // Build the task string — just PR context. Agent instructions come from
+  // prompts.ts (SECURITY_INSTRUCTION, PERFORMANCE_INSTRUCTION, etc.).
+  // Each sandboxed step gets SANDBOX_ID appended at runtime by runReviewer/
+  // runDeveloper.
   const taskString = `PR REVIEW SWARM TASK
 ====================
 
@@ -688,48 +1054,69 @@ ${changedFilesStr}
 PR diff:
 \`\`\`diff
 ${diffPreview}
-\`\`\`
-
-INSTRUCTIONS FOR EACH AGENT:
-
-- Security reviewer: Create a sandbox, clone the repo, check out the PR head,
-  run security linters (tsc --no-errors, eslint, bandit for Python), review the
-  diff and changed files for vulnerabilities. Return findings as markdown.
-- Performance reviewer: Create a sandbox, clone the repo, check out the PR head,
-  review for performance issues (N+1, blocking I/O, memory, etc.). Return findings.
-- Code quality reviewer: Create a sandbox, clone the repo, check out the PR head,
-  run linters (eslint, prettier --check), review for code smells. Return findings.
-- Refuter: Analyze all 3 sets of findings. Filter false positives and out-of-scope
-  issues. Return accepted + rejected findings as markdown. NO sandbox needed.
-- Developer: Create a sandbox, clone the repo, check out the PR head, implement
-  fixes for accepted findings, run tests/linters, generate a git diff. Return the
-  diff, changed file paths, and a summary as markdown with ## Summary, ## Branch,
-  and ## Diff sections.`;
+\`\`\`;`;
 
   // 4. Run the Mastra workflow with streaming
-  const run = await reviewSwarmWorkflow.createRun();
-  const workflowStream = run.stream({
-    inputData: {
-      repository: args.repository,
-      prNumber: args.prNumber,
-      task: taskString,
-    },
-  });
+  try {
+    const run = await reviewSwarmWorkflow.createRun();
+    currentRunAbortController = run.abortController;
+    const workflowStream = run.stream({
+      inputData: {
+        repository: args.repository,
+        prNumber: args.prNumber,
+        headRef: ctx.headRef,
+        task: taskString,
+      },
+    });
 
-  // 5. Stream events — post PR comments as each step completes
-  for await (const event of workflowStream) {
-    if (event.type === 'workflow-step-result' && event.payload?.status === 'success') {
-      await handleStepCompletion(event as StepResultEvent, args.repository, args.prNumber, ctx, args.debug);
+    // 5. Stream events — post PR comments as each step completes
+    for await (const event of workflowStream) {
+      if (event.type === 'workflow-step-result') {
+        if (args.debug) {
+          console.log('workflow-step-result event:', JSON.stringify(event, null, 2));
+        }
+        if (event.payload?.status === 'success') {
+          await handleStepCompletion(event as StepResultEvent, args.repository, args.prNumber, ctx, args.debug);
+        }
+      }
     }
+  } finally {
+    // 6. Safety-net: destroy all sandboxes created during this run.
+    //    Agents no longer self-manage sandbox lifecycle — each step's sandbox
+    //    is created by runReviewer/runDeveloper and killed here. Always runs —
+    //    even if a step throws or the workflow is aborted by a signal.
+    await cleanupSandboxes();
   }
-
-  // 6. Safety-net: destroy any sandboxes agents failed to clean up
-  await cleanupRemainingSandboxes();
 
   console.log('Review swarm complete.');
 }
 
-main().catch((err) => {
+// ── Graceful Shutdown ────────────────────────────────────────────────────────────
+
+// process.once so handlers are registered exactly once.
+process.once('SIGINT', () => {
+  console.log('\nSIGINT — aborting workflow and cleaning up sandboxes...');
+  signalExitCode = 130;
+  // Abort the Mastra workflow so it stops creating/using sandboxes.
+  currentRunAbortController?.abort();
+  // Clean up (idempotent — the finally block may also call this), then exit.
+  // process.exit is called explicitly to ensure we never hang on pending I/O.
+  cleanupSandboxes()
+    .catch((e) => console.warn('Cleanup failed during shutdown:', e))
+    .finally(() => process.exit(signalExitCode ?? 130));
+});
+
+process.once('SIGTERM', () => {
+  console.log('SIGTERM — aborting workflow and cleaning up sandboxes...');
+  signalExitCode = 143;
+  currentRunAbortController?.abort();
+  cleanupSandboxes()
+    .catch((e) => console.warn('Cleanup failed during shutdown:', e))
+    .finally(() => process.exit(signalExitCode ?? 143));
+});
+
+main().catch(async (err) => {
   console.error('Review swarm failed:', err);
-  process.exit(1);
+  await cleanupSandboxes().catch((e) => console.warn('Cleanup failed after error:', e));
+  process.exit(signalExitCode ?? 1);
 });

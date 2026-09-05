@@ -28,7 +28,7 @@ jobs:
           version: '1.4'
 
       - name: Install OpenSandbox (Python infrastructure — sandbox management)
-        run: pip install opensandbox opensandbox-mcp
+        run: pip install opensandbox opensandbox-server opensandbox-mcp
         # NOTE: OpenSandbox is Python-only; this is the only Python dependency in CI.
         # All agent code, app code, and sandbox image are TypeScript/Bun.
 

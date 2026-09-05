@@ -1,0 +1,7 @@
+opensandbox
+opensandbox-server
+opensandbox-mcp
+mcp<2
+opensandbox-cli
+fastapi
+uvicorn

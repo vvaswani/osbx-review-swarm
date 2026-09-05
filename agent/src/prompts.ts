@@ -11,20 +11,25 @@
 // ── Shared sandbox lifecycle instructions ─────────────────────────────────
 
 export const SANDBOX_INSTRUCTIONS = `
-You have access to sandboxed tools (sandbox_create, run_command, read_file,
-write_file, sandbox_kill) connected to an OpenSandbox MCP server.
+You have access to sandboxed tools (command_run, file_read, file_write,
+file_search, file_delete, file_move, file_replace_contents, file_create_directories,
+file_delete_directories, sandbox_get_endpoint, sandbox_get_info) connected to an
+OpenSandbox MCP server.
 
-Sandbox lifecycle:
-1. Create a sandbox via sandbox_create (use image "review-swarm-sandbox:latest")
-2. Clone the repository and checkout the PR head commit
-3. Install project dependencies if needed (bun install, npm install, etc.)
-4. Run linters and/or tests to gather evidence (tsc --no-errors, eslint, prettier --check for TS projects)
-5. Read files and analyze the code
-6. Return your findings as markdown text (NOT structured output — plain markdown is fine)
-7. Destroy your sandbox via sandbox_kill
+A sandbox has already been created and set up for you by the workflow engine.
+Its ID is provided in the task instructions as "SANDBOX_ID: <id>". Use this
+sandbox_id for all tool calls that require it (e.g. command_run). When using
+command_run, set connect_if_missing=True so the MCP server automatically connects
+to the pre-created sandbox.
 
-Always clean up your sandbox when done. If you fail to destroy it, the
-service has a safety-net cleanup, but you should not rely on that.
+The repository is already cloned at /root/project and the PR head is checked
+out. Dependencies are already installed under /root/project/app.
+
+Your job: read files, run linters/tests for evidence, and analyze the code
+(app code is in /root/project/app). Then return your findings as markdown text.
+
+Sandbox cleanup is handled automatically by the service after your step completes.
+You do not need to manage sandbox lifecycle.
 `;
 
 // ── Reviewer prompts ──────────────────────────────────────────────────────
@@ -143,15 +148,13 @@ You are an expert developer implementing fixes for accepted findings.
 ${SANDBOX_INSTRUCTIONS}
 
 You will receive accepted findings from the refuter. Your job is:
-1. Create a sandbox
-2. Clone the repository and checkout the PR head
-3. Install dependencies (bun install for TS projects)
-4. Implement fixes for each accepted finding
-5. Run tests and linters to verify your fixes (tsc --no-errors, eslint, prettier --check, bun test)
-6. Generate a git diff showing all your changes
-7. Create a new branch for the fix (naming: fix/review-swarm-{branch_id})
-8. Return the diff, changed file paths, and a summary as markdown text
-9. Destroy your sandbox
+1. Use the pre-created sandbox (ID provided in the task as SANDBOX_ID) — the repo is
+   already cloned at /root/project with deps installed under /root/project/app.
+2. Implement fixes for each accepted finding
+3. Run tests and linters to verify your fixes (tsc --no-errors, eslint, prettier --check, bun test)
+4. Generate a git diff showing all your changes
+5. Create a new branch for the fix (naming: fix/review-swarm-{branch_id})
+6. Return the diff, changed file paths, and a summary as markdown text
 
 Do NOT push the branch or open a PR — the service layer handles that.
 You should NOT interact with GitHub directly.

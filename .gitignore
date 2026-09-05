@@ -5,6 +5,9 @@ bun.lock
 *.tsbuildinfo
 dist/
 
+# Python
+**/.venv
+
 # IDE
 .idea/
 .vscode/
