@@ -152,7 +152,17 @@ describe('App', () => {
       const updated = JSON.parse(res.body);
       expect(updated.title).toBe(TEST_BOOKS[1].title);
       expect(updated.author).toBe(TEST_BOOKS[1].author);
+      expect(updated.publisher).toBe(TEST_BOOKS[1].publisher);
       expect(updated.id).toBe(created.id);
+    });
+
+    it('should reject a book without publisher', async () => {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/books',
+        body: { title: 'No Publisher', author: 'Unknown Author' },
+      });
+      expect(res.statusCode).toBe(400);
     });
 
     it('should delete a book', async () => {
