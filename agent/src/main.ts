@@ -374,6 +374,17 @@ let cleanupPromise: Promise<void> | null = null;
 let signalExitCode: number | null = null;
 
 /**
+ * Promise that rejects after `ms` milliseconds — used to race against
+ * operations that can hang during SIGINT/SIGTERM (e.g. HTTP DELETE to a
+ * shutting-down OpenSandbox server).
+ */
+function timeout(ms: number): Promise<never> {
+  return new Promise((_, reject) =>
+    setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms),
+  );
+}
+
+/**
  * Idempotent, single-flight sandbox cleanup.
  *
  * Kills each Sandbox instance created during this run by calling
@@ -415,12 +426,22 @@ async function cleanupSandboxes(): Promise<void> {
       const id = sandbox.id;
       console.log(`Deleting sandbox ${id}`);
       try {
-        await sandbox.kill();
+        // Race the kill against a timeout — during SIGINT the OpenSandbox
+        // lifecycle API may be unreachable, causing sandbox.kill() (which
+        // makes an HTTP DELETE) to hang indefinitely and blocking process.exit.
+        await Promise.race([sandbox.kill(), timeout(10000)]);
         console.log(`Deleted sandbox ${id}`);
         cleaned++;
       } catch (e: any) {
         console.warn(`Error deleting sandbox ${id}:`, e);
       } finally {
+        // Always close the SDK's HTTP transport — keeps the event loop clean
+        // so the process can exit without hanging on open connections.
+        try {
+          await sandbox.close();
+        } catch (e: any) {
+          console.warn(`Error closing transport for sandbox ${id}:`, e);
+        }
         createdSandboxIds.delete(id);
       }
     }
@@ -609,6 +630,8 @@ function formatRefutedComment(findings: string): string {
 
 /**
  * Format the developer's changeset into a PR comment.
+ *
+ * Heading hierarchy: H1 (# Fix Applied) → H2 sections (## Diff, ## Sub-PR, ## Test Results).
  */
 function formatChangesetComment(
   diff: string,
@@ -618,9 +641,9 @@ function formatChangesetComment(
   testResults: string,
 ): string {
   const testSection = testResults
-    ? `\n\n#### Test Results\n\`\`\`\n${testResults.slice(0, 3000)}\n\`\`\``
+    ? `\n\n## Test Results\n\`\`\`\n${testResults.slice(0, 3000)}\n\`\`\``
     : '';
-  return `### Fix Applied\n\n**Branch:** \`${branch}\`\n\n**Summary:** ${summary}\n\n#### Diff\n\`\`\`diff\n${diff.slice(0, 3000)}\n\`\`\`\n\n#### Sub-PR: ${subPrUrl}${testSection}`;
+  return `# Fix Applied\n\n**Branch:** \`${branch}\`\n\n**Summary:** ${summary}\n\n## Diff\n\`\`\`diff\n${diff.slice(0, 3000)}\n\`\`\`\n\n## Sub-PR\n${subPrUrl}${testSection}`;
 }
 
 // ── Mastra Workflow ───────────────────────────────────────────────────────────
@@ -960,9 +983,8 @@ async function handleStepCompletion(
         `handleStepCompletion: step '${stepId}' completed successfully but ` +
         `no developer output was extracted. Skipping comment to avoid a header-only post.`,
       );
-      if (debug) {
-        console.log(`  event.payload.output:`, JSON.stringify(event.payload?.output));
-      }
+      // Always log — empty developer output is a silent failure that must surface.
+      console.log(`  event.payload.output:`, JSON.stringify(event.payload?.output));
       return;
     }
     if (debug) {

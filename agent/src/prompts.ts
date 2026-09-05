@@ -17,6 +17,8 @@ You have access to a sandboxed environment with tools to read/write files and ru
 
 Within the sandbox, the repository is checked out at /root/project; the application code under test lives in /root/project/app.
 
+Get the PR diff: git diff origin/{base_branch}...HEAD in /root/project/app
+
 Sandbox cleanup is handled automatically after your step completes. You do not need to manage sandbox lifecycle.
 `;
 

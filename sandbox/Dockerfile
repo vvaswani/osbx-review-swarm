@@ -2,7 +2,7 @@ FROM oven/bun:1.4-alpine
 
 # System packages: build tools, git, polyglot runtimes + PostgreSQL
 RUN apk add --no-cache \
-    git curl jq \
+    git curl jq bash \
     build-base \
     postgresql postgresql-contrib \
     nodejs npm \
