@@ -6,12 +6,18 @@
  * validation and error responses.
  */
 
-import type { FastifyInstance, FastifyError } from 'fastify';
-import { z } from 'zod';
-import { zodToJsonSchema } from 'zod-to-json-schema';
+import type { FastifyInstance, FastifyError } from "fastify";
+import { z } from "zod";
+import { zodToJsonSchema } from "zod-to-json-schema";
 
-import { BookInSchema, BookOutSchema, BookIn, BookOut } from './models';
-import { createBook, getBooks, getBook, updateBook, deleteBook } from './repositories';
+import { BookInSchema, BookOutSchema, BookIn, BookOut } from "./models";
+import {
+  createBook,
+  getBooks,
+  getBook,
+  updateBook,
+  deleteBook,
+} from "./repositories";
 
 // ── JSON Schema derived from Zod schemas ──────────────────────────────────────
 
@@ -21,20 +27,20 @@ const bookListSchema = zodToJsonSchema(z.array(BookOutSchema));
 
 // Params: id must be a positive integer (validated as string pattern from URL)
 const bookIdParamSchema = {
-  type: 'object',
+  type: "object",
   properties: {
-    id: { type: 'string', pattern: '^[0-9]+$' },
+    id: { type: "string", pattern: "^[0-9]+$" },
   },
-  required: ['id'],
+  required: ["id"],
   additionalProperties: false,
 };
 
 // Querystring: skip/limit for pagination
 const querySchema = {
-  type: 'object',
+  type: "object",
   properties: {
-    skip: { type: 'string', pattern: '^[0-9]+$' },
-    limit: { type: 'string', pattern: '^[0-9]+$' },
+    skip: { type: "string", pattern: "^[0-9]+$" },
+    limit: { type: "string", pattern: "^[0-9]+$" },
   },
   required: [],
   additionalProperties: false,
@@ -48,12 +54,16 @@ interface ApiError {
   message: string;
 }
 
-function notFound(message = 'Book not found'): ApiError {
-  return { ok: false, error: { title: 'Not Found', status: 404 }, message };
+function notFound(message = "Book not found"): ApiError {
+  return { ok: false, error: { title: "Not Found", status: 404 }, message };
 }
 
-function serverError(message = 'An unexpected error occurred'): ApiError {
-  return { ok: false, error: { title: 'Internal Server Error', status: 500 }, message };
+function serverError(message = "An unexpected error occurred"): ApiError {
+  return {
+    ok: false,
+    error: { title: "Internal Server Error", status: 500 },
+    message,
+  };
 }
 
 // ── Route registration ────────────────────────────────────────────────────────
@@ -75,17 +85,17 @@ export function registerRoutes(app: FastifyInstance) {
     reply.code(statusCode).send({
       ok: false,
       error: {
-        title: statusCode === 400 ? 'Bad Request' : 'Client Error',
+        title: statusCode === 400 ? "Bad Request" : "Client Error",
         status: statusCode,
       },
-      message: error.message || 'Request validation failed',
+      message: error.message || "Request validation failed",
     });
   });
 
   // ── Create a book ─────────────────────────────────────────────────────────
 
   app.post<{ Body: BookIn }>(
-    '/books',
+    "/books",
     { schema: { body: bookInSchema, response: { 201: bookOutSchema } } },
     async (request, reply) => {
       try {
@@ -94,8 +104,8 @@ export function registerRoutes(app: FastifyInstance) {
       } catch (e) {
         // Log full error server-side, return generic message to client
         const err = e instanceof Error ? e : new Error(String(e));
-        request.log.error(err, 'Failed to create book');
-        return reply.code(500).send(serverError('Failed to create book'));
+        request.log.error(err, "Failed to create book");
+        return reply.code(500).send(serverError("Failed to create book"));
       }
     },
   );
@@ -103,11 +113,13 @@ export function registerRoutes(app: FastifyInstance) {
   // ── Get all books (with pagination) ────────────────────────────────────────
 
   app.get<{ Querystring: { skip?: string; limit?: string } }>(
-    '/books',
+    "/books",
     { schema: { querystring: querySchema, response: { 200: bookListSchema } } },
     async (request, reply) => {
       const skip = request.query.skip ? parseInt(request.query.skip, 10) : 0;
-      const limit = request.query.limit ? parseInt(request.query.limit, 10) : 10;
+      const limit = request.query.limit
+        ? parseInt(request.query.limit, 10)
+        : 10;
       const allBooks = await getBooks(skip, limit);
       return allBooks;
     },
@@ -116,7 +128,7 @@ export function registerRoutes(app: FastifyInstance) {
   // ── Get a book by ID ───────────────────────────────────────────────────────
 
   app.get<{ Params: { id: string } }>(
-    '/books/:id',
+    "/books/:id",
     { schema: { params: bookIdParamSchema, response: { 200: bookOutSchema } } },
     async (request, reply) => {
       const book = await getBook(Number(request.params.id));
@@ -130,8 +142,14 @@ export function registerRoutes(app: FastifyInstance) {
   // ── Update a book ──────────────────────────────────────────────────────────
 
   app.put<{ Params: { id: string }; Body: BookIn }>(
-    '/books/:id',
-    { schema: { params: bookIdParamSchema, body: bookInSchema, response: { 200: bookOutSchema } } },
+    "/books/:id",
+    {
+      schema: {
+        params: bookIdParamSchema,
+        body: bookInSchema,
+        response: { 200: bookOutSchema },
+      },
+    },
     async (request, reply) => {
       const bookId = Number(request.params.id);
       const book = await updateBook(bookId, request.body);
@@ -145,7 +163,7 @@ export function registerRoutes(app: FastifyInstance) {
   // ── Delete a book ──────────────────────────────────────────────────────────
 
   app.delete<{ Params: { id: string } }>(
-    '/books/:id',
+    "/books/:id",
     { schema: { params: bookIdParamSchema, response: { 200: bookOutSchema } } },
     async (request, reply) => {
       const bookId = Number(request.params.id);
