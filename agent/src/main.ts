@@ -140,40 +140,44 @@ async function getPrContext(repository: string, prNumber: number): Promise<PrCon
   };
 }
 
+interface MinimizableComment {
+  id: string;          // GraphQL node id
+  databaseId: number;  // REST comment id, for logging
+  isMinimized: boolean;
+  body: string;
+}
+
 /**
- * Find previous bot comments on the PR and minimize them as OUTDATED via GraphQL.
+ * Fetch all issue comments on the PR via GraphQL, including isMinimized,
+ * so we can skip comments that are already minimized.
  */
-async function minimizeOldComments(repository: string, prNumber: number): Promise<void> {
+async function fetchCommentsWithMinimizedStatus(
+  repository: string,
+  prNumber: number,
+): Promise<MinimizableComment[]> {
   const [owner, repoName] = parseRepo(repository);
+  const results: MinimizableComment[] = [];
+  let cursor: string | null = null;
 
-  const comments = await octokit.paginate(octokit.rest.issues.listComments, {
-    owner,
-    repo: repoName,
-    issue_number: prNumber,
-    per_page: 100,
-  });
-
-  const matcherComments = comments.filter((c) => c.body?.includes(GITHUB_MARKER));
-  console.log(`Found ${comments.length} total comments, ${matcherComments.length} with the review-swarm marker`);
-
-  for (const comment of comments) {
-    if (!comment.body?.includes(GITHUB_MARKER)) continue;
-
-    if (!comment.node_id) {
-      console.warn(`Skipping comment id=${comment.id} — node_id is missing, cannot minimize`);
-      continue;
-    }
-
-    console.log(`Minimizing old comment id=${comment.id} node_id=${comment.node_id}`);
-
-    const query = `
-      mutation($input: MinimizeCommentInput!) {
-        minimizeComment(input: $input) {
-          clientMutationId
+  const query = `
+    query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+      repository(owner: $owner, name: $name) {
+        issue(number: $number) {
+          comments(first: 100, after: $cursor) {
+            nodes {
+              id
+              databaseId
+              body
+              isMinimized
+            }
+            pageInfo { hasNextPage endCursor }
+          }
         }
       }
-    `;
+    }
+  `;
 
+  do {
     const response = await fetch(GITHUB_GRAPHQL_URL, {
       method: 'POST',
       headers: {
@@ -183,9 +187,87 @@ async function minimizeOldComments(repository: string, prNumber: number): Promis
       },
       body: JSON.stringify({
         query,
+        variables: { owner, name: repoName, number: prNumber, cursor },
+      }),
+    });
+
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`GraphQL comment fetch failed: ${response.status} ${text}`);
+    }
+
+    const result = await response.json() as {
+      data?: {
+        repository?: {
+          issue?: {
+            comments: {
+              nodes: MinimizableComment[];
+              pageInfo: { hasNextPage: boolean; endCursor: string | null };
+            };
+          } | null;
+        } | null;
+      };
+      errors?: Array<{ message: string }>;
+    };
+
+    if (result.errors && result.errors.length > 0) {
+      throw new Error(`GraphQL comment fetch error: ${result.errors.map((e) => e.message).join(', ')}`);
+    }
+
+    const comments = result.data?.repository?.issue?.comments;
+    if (!comments) break;
+
+    results.push(...comments.nodes);
+    cursor = comments.pageInfo.hasNextPage ? comments.pageInfo.endCursor : null;
+  } while (cursor);
+
+  return results;
+}
+
+/**
+ * Find previous bot comments on the PR that carry the marker and are not
+ * already minimized, and minimize them as OUTDATED via GraphQL.
+ */
+async function minimizeOldComments(repository: string, prNumber: number): Promise<void> {
+  const allComments = await fetchCommentsWithMinimizedStatus(repository, prNumber);
+
+  const toMinimize = allComments.filter(
+    (c) => c.body?.includes(GITHUB_MARKER) && !c.isMinimized,
+  );
+
+  console.log(
+    `Found ${allComments.length} total comments, ${toMinimize.length} marked ` +
+    `and not yet minimized (skipping already-minimized ones)`,
+  );
+
+  const mutation = `
+    mutation($input: MinimizeCommentInput!) {
+      minimizeComment(input: $input) {
+        clientMutationId
+      }
+    }
+  `;
+
+  for (const comment of toMinimize) {
+    if (!comment.id) {
+      console.warn(`Skipping comment databaseId=${comment.databaseId} — node id is missing, cannot minimize`);
+      continue;
+    }
+
+    console.log(`Minimizing old comment databaseId=${comment.databaseId} id=${comment.id}`);
+
+    const response = await fetch(GITHUB_GRAPHQL_URL, {
+      method: 'POST',
+      headers: {
+        Authorization: `bearer ${GITHUB_TOKEN}`,
+        Accept: 'application/vnd.github+json',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        query: mutation,
         variables: {
           input: {
-            subjectId: comment.node_id,
+            subjectId: comment.id,
             classifier: 'OUTDATED',
             clientMutationId: crypto.randomUUID(),
           },
@@ -199,34 +281,25 @@ async function minimizeOldComments(repository: string, prNumber: number): Promis
       continue;
     }
 
-    // GitHub GraphQL returns 200 even when the mutation has errors.
     const result = await response.json() as {
-      data?: {
-        minimizeComment?: {
-          clientMutationId?: string;
-        } | null;
-      };
+      data?: { minimizeComment?: { clientMutationId?: string } | null };
       errors?: Array<{ message: string }>;
     };
+
     if (result.errors && result.errors.length > 0) {
-      console.warn(
-        `GraphQL minimize error: ${result.errors.map((e) => e.message).join(', ')}`,
-      );
+      console.warn(`GraphQL minimize error: ${result.errors.map((e) => e.message).join(', ')}`);
       continue;
     }
 
-    // The mutation can return { data: { minimizeComment: null } } without
-    // an errors array — this means the minimize silently failed (e.g. the
-    // caller lacks permission, the node_id is invalid, etc.).
     if (!result.data?.minimizeComment) {
       console.warn(
-        `minimizeComment returned null for comment id=${comment.id} — ` +
+        `minimizeComment returned null for databaseId=${comment.databaseId} — ` +
         `the comment was NOT minimized. Full response: ${JSON.stringify(result)}`,
       );
       continue;
     }
 
-    console.log(`Minimized comment id=${comment.id}`);
+    console.log(`Minimized comment databaseId=${comment.databaseId}`);
   }
 }
 
@@ -281,7 +354,11 @@ function parseDeveloperOutput(text: string): DeveloperOutput {
 
   return {
     summary: (summaryMatch?.[1] || '').trim(),
-    branch: (branchMatch?.[1] || '').trim(),
+    // Strip backticks (and other markdown code ticks) so the branch name is
+    // safe to interpolate into shell commands — without this, backticks in
+    // the agent's `## Branch` output get interpreted as shell command
+    // substitution by bash, e.g. `git checkout -B `fix/review-swarm-abc123``.
+    branch: (branchMatch?.[1] || '').trim().replace(/`/g, ''),
     diff: (diffMatch?.[1] || '').trim(),
     subPrUrl: '',
     testResults: (testResultsMatch?.[1] || '').trim(),
@@ -464,6 +541,42 @@ function generateWithLimit(
 }
 
 /**
+ * Kill a single sandbox immediately and remove it from the tracking arrays.
+ *
+ * Used to free resources early: reviewer sandboxes are killed right after
+ * their agent finishes (they're no longer needed), and the developer sandbox
+ * is killed right after commit+push. This is critical under the default
+ * `SANDBOX_RESOURCE_LIMITS = { cpu: '1', memory: '2Gi' }` — keeping 3-4
+ * sandboxes alive simultaneously causes CPU/network contention that can make
+ * git operations hang and get killed by the timeout (exit code -1).
+ *
+ * The 10s timeout on kill() mirrors cleanupSandboxes — during shutdown the
+ * OpenSandbox lifecycle API may be unreachable.
+ *
+ * Individual failures are logged as warnings — killing an already-dead
+ * sandbox is a no-op.
+ */
+async function killSandbox(sandbox: Sandbox): Promise<void> {
+  const id = sandbox.id;
+  console.log(`[killSandbox] Killing sandbox ${id}`);
+  try {
+    await Promise.race([sandbox.kill(), timeout(10000)]);
+    console.log(`[killSandbox] Deleted sandbox ${id}`);
+  } catch (e: any) {
+    console.warn(`[killSandbox] Error killing sandbox ${id}:`, e);
+  } finally {
+    try {
+      await sandbox.close();
+    } catch (e: any) {
+      console.warn(`[killSandbox] Error closing transport for sandbox ${id}:`, e);
+    }
+    createdSandboxIds.delete(id);
+    const idx = createdSandboxes.findIndex((s) => s.id === id);
+    if (idx !== -1) createdSandboxes.splice(idx, 1);
+  }
+}
+
+/**
  * Idempotent, single-flight sandbox cleanup.
  *
  * Kills each Sandbox instance created during this run by calling
@@ -601,6 +714,36 @@ function executionResult(execution: Execution): CommandRunResult {
   };
 }
 
+/**
+ * Retry an async operation with linear backoff. Used for the initial
+ * git clone, which is the step most exposed to transient sandbox/network
+ * hiccups — a single retry here is far cheaper than re-running the whole
+ * develop_fix step (and losing the agent's tool-call work).
+ */
+async function withRetry<T>(
+  fn: () => Promise<T>,
+  opts: { attempts: number; baseDelayMs: number; label: string },
+): Promise<T> {
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= opts.attempts; attempt++) {
+    try {
+      return await fn();
+    } catch (e) {
+      lastErr = e;
+      if (attempt < opts.attempts) {
+        const delay = opts.baseDelayMs * attempt;
+        console.warn(
+          `[withRetry] ${opts.label} failed on attempt ${attempt}/${opts.attempts}: ${
+            e instanceof Error ? e.message : String(e)
+          } — retrying in ${delay}ms`,
+        );
+        await new Promise((r) => setTimeout(r, delay));
+      }
+    }
+  }
+  throw lastErr;
+}
+
 async function runCommandInSandbox(
   sandbox: Sandbox,
   command: string,
@@ -611,7 +754,18 @@ async function runCommandInSandbox(
     command,
     { workingDirectory, timeoutSeconds } as RunCommandOpts,
   );
-  return executionResult(execution);
+  const result = executionResult(execution);
+  // A negative or null exit code means the SDK couldn't get a real exit
+  // status back — almost always the command was killed by timeoutSeconds
+  // or the exec channel dropped, NOT a normal command failure.
+  if (result.exit_code === null || result.exit_code < 0) {
+    console.warn(
+      `[runCommandInSandbox] Command produced no real exit code (got ${result.exit_code}) — ` +
+      `likely killed by the ${timeoutSeconds}s timeout or a dropped exec channel. ` +
+      `command="${command}"`,
+    );
+  }
+  return result;
 }
 
 async function setupSandbox(
@@ -622,16 +776,28 @@ async function setupSandbox(
   await startSandboxServices(sandbox);
   console.log(`[setupSandbox] Cloning ${repository} into sandbox ${sandbox.id}...`);
 
-  // 1. Clone the repo (working_directory "/" since /root/project doesn't exist yet)
-  const cloneResult = await runCommandInSandbox(
-    sandbox,
-    `git clone https://github.com/${repository}.git /root/project`,
-    '/',
+  // 1. Clone the repo (working_directory "/" since /root/project doesn't exist yet).
+  //    Retried with withRetry — this is the step most exposed to transient
+  //    sandbox/network hiccups, and a single retry is far cheaper than
+  //    re-running the entire develop_fix step (losing the agent's tool-call work).
+  //    600s timeout per attempt (up from 300s) to give slow/contended clones
+  //    room to finish instead of being killed and surfacing as exit -1.
+  const cloneResult = await withRetry(
+    () =>
+      runCommandInSandbox(
+        sandbox,
+        `git clone https://github.com/${repository}.git /root/project`,
+        '/',
+        600,
+      ),
+    { attempts: 3, baseDelayMs: 5000, label: `git clone (sandbox ${sandbox.id})` },
   );
   if (cloneResult.exit_code !== 0) {
-    throw new Error(
-      `Git clone failed (exit ${cloneResult.exit_code}): ${cloneResult.stderr || 'no stderr'}`,
-    );
+    const reason =
+      cloneResult.exit_code === null || cloneResult.exit_code < 0
+        ? `likely killed by timeout or a dropped exec channel (exit ${cloneResult.exit_code})`
+        : `exit ${cloneResult.exit_code}`;
+    throw new Error(`Git clone failed after retries (${reason}): ${cloneResult.stderr || 'no stderr'}`);
   }
 
   // 2. Checkout the PR head
@@ -883,6 +1049,12 @@ async function runReviewer(instructions: string, task: string, repository: strin
     return result.text;
   } finally {
     await mcp.disconnect();
+    // Reviewer sandbox is no longer needed — kill it immediately to free
+    // CPU/memory for the remaining reviewers and the developer step.
+    // This is critical under the default resource limits (1 CPU / 2Gi) —
+    // keeping 4 sandboxes alive simultaneously causes contention that
+    // can make git operations hang and get killed by the timeout.
+    await killSandbox(sandbox);
   }
 }
 
@@ -890,8 +1062,9 @@ async function runReviewer(instructions: string, task: string, repository: strin
  * Run the developer step: create MCPClient + Agent, implement fixes, get diff.
  *
  * A sandbox is created (via SDK) before the agent runs and its ID is
- * injected into the task string. The cleanupSandboxes() safety-net handles
- * destruction — the agent never needs to call sandbox_create or sandbox_kill.
+ * injected into the task string. The developer sandbox is killed immediately
+ * after commit+push (it's no longer needed); cleanupSandBoxes() remains as
+ * a safety-net for any sandboxes still alive if the step throws.
  */
 async function runDeveloper(
   instructions: string,
@@ -922,6 +1095,17 @@ async function runDeveloper(
     }
     const output = parseDeveloperOutput(result.text || '');
 
+    // Warn when the agent hit the step limit — its final action may have been
+    // a tool call, meaning the structured output (## Summary, ## Branch, etc.)
+    // was never produced. The fallback branch generator will still create a
+    // branch, but the diff/summary/testResults will be empty.
+    if (result.finishReason === 'tool-calls' && !output.summary) {
+      console.warn(
+        `[runDeveloper] WARNING: Agent hit step limit (finishReason: tool-calls) — ` +
+        `output may be incomplete. Consider increasing maxSteps or using --limiter.`,
+      );
+    }
+
     // Commit and push the fix via git in the sandbox, then create a sub-PR.
     // If the agent copied the literal placeholder (xxxxxxxx), generate a real branch name.
     if (output.branch && output.branch.includes('xxxxxxxx')) {
@@ -929,6 +1113,11 @@ async function runDeveloper(
     }
     const fixBranch = output.branch || `fix/review-swarm-${crypto.randomUUID().slice(0, 8)}`;
     const pushedBranch = await gitCommitAndPush(sandbox, repository, fixBranch, prNumber);
+
+    // Developer sandbox is no longer needed after commit+push — kill it
+    // immediately to free resources (same reasoning as reviewer sandboxes).
+    await killSandbox(sandbox);
+
     if (pushedBranch) {
       output.subPrUrl = await createFixBranchAndPr(repository, headRef, pushedBranch, output.summary);
     }
