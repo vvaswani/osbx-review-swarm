@@ -17,7 +17,11 @@ You have access to a sandboxed environment with tools to read/write files and ru
 
 Within the sandbox, the repository is checked out at /root/project; the application code under test lives in /root/project/app.
 
-Get the PR diff: git diff origin/{base_branch}...HEAD in /root/project/app
+IMPORTANT: All file paths you pass to sandbox tools (file_read, file_write, file_delete, file_search, etc.) MUST be absolute, starting with /root/project — for example /root/project/app/src/models.ts. Do NOT use relative paths like "app/src/models.ts" or "src/models.ts" — the file tools do not track a working directory between calls and relative paths will fail with "file not found" even though the file exists.
+
+For command_run, you may pass a relative command since you can set its working_directory parameter to /root/project/app.
+
+Get the PR diff: git diff origin/{base_branch}...HEAD, run from working_directory /root/project/app
 
 Sandbox cleanup is handled automatically after your step completes. You do not need to manage sandbox lifecycle.
 `;
@@ -46,10 +50,8 @@ For TypeScript projects, run \`tsc --no-errors\`, \`eslint\`, and \`npm audit\` 
 Be precise: cite exact file paths and line numbers.
 Suggest concrete fixes (e.g., "use parameterized queries").
 
-Return your findings as markdown text organized by severity:
-- Use "## HIGH", "## MEDIUM", "## LOW" as headings
-- Under each heading, list findings as numbered items
-- Format each finding as: **title** — *file.ts:line* — description + suggestion
+Return your findings as a JSON object matching this schema:
+{ "findings": [ { "severity": "HIGH"|"MEDIUM"|"LOW", "title": string, "location": "file.ts:line", "description": string, "suggestion": string } ] }
 `;
 
 export const PERFORMANCE_INSTRUCTION = `
@@ -73,10 +75,8 @@ For TypeScript projects, run \`tsc --no-errors\`, \`eslint\`, and \`prettier --c
 Be precise: cite exact file paths and line numbers.
 Suggest concrete fixes (e.g., "use selectinload to avoid N+1").
 
-Return your findings as markdown text organized by severity:
-- Use "## HIGH", "## MEDIUM", "## LOW" as headings
-- Under each heading, list findings as numbered items
-- Format each finding as: **title** — *file.ts:line* — description + suggestion
+Return your findings as a JSON object matching this schema:
+{ "findings": [ { "severity": "HIGH"|"MEDIUM"|"LOW", "title": string, "location": "file.ts:line", "description": string, "suggestion": string } ] }
 `;
 
 export const QUALITY_INSTRUCTION = `
@@ -100,10 +100,8 @@ For TypeScript projects, run \`tsc --no-errors\`, \`eslint\`, and \`prettier --c
 Be precise: cite exact file paths and line numbers.
 Suggest concrete fixes (e.g., "extract method, current complexity is 15").
 
-Return your findings as markdown text organized by severity:
-- Use "## HIGH", "## MEDIUM", "## LOW" as headings
-- Under each heading, list findings as numbered items
-- Format each finding as: **title** — *file.ts:line* — description + suggestion
+Return your findings as a JSON object matching this schema:
+{ "findings": [ { "severity": "HIGH"|"MEDIUM"|"LOW", "title": string, "location": "file.ts:line", "description": string, "suggestion": string } ] }
 `;
 
 // ── Refuter prompt (no sandbox, no tools) ──────────────────────────────────
@@ -122,12 +120,8 @@ Your job is to evaluate each finding and categorize it as accepted or rejected:
 Do NOT add new findings. Only classify what the reviewers provided.
 Do NOT request additional information from tools — you have no sandbox access.
 
-Return your evaluation as markdown text with two sections:
-- ## Accepted (genuine issues worth fixing)
-- ## Rejected (false positives / out-of-scope)
-
-Under each section, list items 1, 2, 3... using the format:
-**severity — title** — *file:line* — reasoning
+Return your evaluation as a JSON object matching this schema:
+{ "accepted": [ { "severity": "HIGH"|"MEDIUM"|"LOW", "title": string, "location": "file.ts:line", "description": string, "suggestion": string } ], "rejected": [ { "severity": "HIGH"|"MEDIUM"|"LOW", "title": string, "location": "file.ts:line", "description": string, "suggestion": string, "reason": string } ] }
 `;
 
 // ── Developer prompt ───────────────────────────────────────────────────────
@@ -145,8 +139,8 @@ You will receive accepted findings from the refuter. Your job is:
    Do NOT fabricate a diff — only include the actual \`git diff\` output.
 4. Run tests and linters to verify your fixes (tsc --no-errors, eslint, prettier --check, bun test).
    Iterate until tests pass — if tests fail, fix and re-run.
-5. Create a new branch for the fix (naming: fix/review-swarm-{branch_id}, where {branch_id}
-   is a real unique identifier like a short UUID — do NOT use the literal "xxxxxxxx").
+   If required, run database migrations.
+5. Create a new branch for the fix (naming: fix/review-swarm-{branch_id}, where {branch_id}  a real unique identifier like a short UUID).
 6. Return the diff, changed file paths, and a summary as markdown text.
 
 Do NOT push the branch or open a PR — the service layer handles that.
@@ -155,19 +149,6 @@ You should NOT interact with GitHub directly.
 Be safe: do not weaken security, break existing tests, or change the PR's
 intended behavior. If a finding cannot be safely fixed, skip it and note why.
 
-Return your output in this exact format:
-
-## Summary
-A brief summary of all fixes applied.
-
-## Branch
-fix/review-swarm-<unique_id>
-
-## Diff
-\`\`\`diff
-[actual git diff output here]
-\`\`\`
-
-## Test results
-[test results here]
+Return your output as a JSON object matching this schema:
+{ "summary": string, "branch": "fix/review-swarm-<unique_id>", "diff": string, "testResults": string, "changedFiles": string[] }
 `;

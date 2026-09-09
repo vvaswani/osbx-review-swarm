@@ -16,6 +16,9 @@
  *
  * All GitHub API work (minimize old comments, post PR comments, create fix
  * branch + sub-PR) is handled in the service layer — never inside an agent.
+ *
+ * export OPENSANDBOX_INSECURE_SERVER=YES opensandbox-server
+ * opensandbox-mcp --domain localhost:8080 --protocol http --transport streamable-http
  */
 
 import { Workflow, createStep } from '@mastra/core/workflows';
@@ -162,7 +165,7 @@ async function fetchCommentsWithMinimizedStatus(
   const query = `
     query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
       repository(owner: $owner, name: $name) {
-        issue(number: $number) {
+        pullRequest(number: $number) {
           comments(first: 100, after: $cursor) {
             nodes {
               id
@@ -199,7 +202,7 @@ async function fetchCommentsWithMinimizedStatus(
     const result = await response.json() as {
       data?: {
         repository?: {
-          issue?: {
+          pullRequest?: {
             comments: {
               nodes: MinimizableComment[];
               pageInfo: { hasNextPage: boolean; endCursor: string | null };
@@ -214,8 +217,20 @@ async function fetchCommentsWithMinimizedStatus(
       throw new Error(`GraphQL comment fetch error: ${result.errors.map((e) => e.message).join(', ')}`);
     }
 
-    const comments = result.data?.repository?.issue?.comments;
-    if (!comments) break;
+    const comments = result.data?.repository?.pullRequest?.comments;
+    if (!comments) {
+      // No comments field at all — either the PR doesn't exist, or the
+      // response shape changed. Log loudly instead of silently returning
+      // an empty list, since that failure mode is exactly what caused
+      // this bug to go unnoticed.
+      if (results.length === 0) {
+        console.warn(
+          `[fetchCommentsWithMinimizedStatus] repository.pullRequest.comments missing from ` +
+          `GraphQL response — got: ${JSON.stringify(result.data)}`,
+        );
+      }
+      break;
+    }
 
     results.push(...comments.nodes);
     cursor = comments.pageInfo.hasNextPage ? comments.pageInfo.endCursor : null;
@@ -243,7 +258,10 @@ async function minimizeOldComments(repository: string, prNumber: number): Promis
   const mutation = `
     mutation($input: MinimizeCommentInput!) {
       minimizeComment(input: $input) {
-        clientMutationId
+        minimizedComment {
+          isMinimized
+          minimizedReason
+        }
       }
     }
   `;
@@ -251,6 +269,17 @@ async function minimizeOldComments(repository: string, prNumber: number): Promis
   for (const comment of toMinimize) {
     if (!comment.id) {
       console.warn(`Skipping comment databaseId=${comment.databaseId} — node id is missing, cannot minimize`);
+      continue;
+    }
+
+    // Belt-and-suspenders: re-check isMinimized right before mutating, in
+    // case it changed between the fetch above and this point in the loop
+    // (e.g. another run minimized it concurrently). Cheap since it's just
+    // reading data we already fetched — this makes the "don't re-minimize
+    // already-minimized comments" guarantee hold even under races, not
+    // just at fetch time.
+    if (comment.isMinimized) {
+      console.log(`Skipping comment databaseId=${comment.databaseId} — already minimized`);
       continue;
     }
 
@@ -282,7 +311,7 @@ async function minimizeOldComments(repository: string, prNumber: number): Promis
     }
 
     const result = await response.json() as {
-      data?: { minimizeComment?: { clientMutationId?: string } | null };
+      data?: { minimizeComment?: { minimizedComment?: { isMinimized: boolean; minimizedReason: string } | null } | null };
       errors?: Array<{ message: string }>;
     };
 
@@ -291,15 +320,16 @@ async function minimizeOldComments(repository: string, prNumber: number): Promis
       continue;
     }
 
-    if (!result.data?.minimizeComment) {
+    const minimized = result.data?.minimizeComment?.minimizedComment;
+    if (!minimized?.isMinimized) {
       console.warn(
-        `minimizeComment returned null for databaseId=${comment.databaseId} — ` +
-        `the comment was NOT minimized. Full response: ${JSON.stringify(result)}`,
+        `minimizeComment returned no confirmed isMinimized:true for databaseId=${comment.databaseId} — ` +
+        `the comment may NOT have been minimized. Full response: ${JSON.stringify(result)}`,
       );
       continue;
     }
 
-    console.log(`Minimized comment databaseId=${comment.databaseId}`);
+    console.log(`Minimized comment databaseId=${comment.databaseId} (reason: ${minimized.minimizedReason})`);
   }
 }
 
@@ -318,51 +348,6 @@ async function postPrComment(repository: string, prNumber: number, body: string)
 
   console.log(`Posted comment: ${comment.html_url}`);
   return comment.html_url;
-}
-
-interface DeveloperOutput {
-  diff: string;
-  summary: string;
-  branch?: string;
-  subPrUrl: string;
-  testResults: string;
-}
-
-/**
- * Parse the developer agent's markdown output to extract diff, summary, and branch name.
- *
- * Expected format (from DEVELOPER_INSTRUCTION):
- * ## Summary
- * ...
- *
- * ## Branch
- * fix/review-swarm-xxxxxxxx
- *
- * ## Diff
- * ```diff
- * ...
- * ```
- *
- * ## Test results
- * ...
- */
-function parseDeveloperOutput(text: string): DeveloperOutput {
-  const summaryMatch = text.match(/## Summary\s*\n([\s\S]*?)(?=\n##|\n```|$)/);
-  const branchMatch = text.match(/## Branch\s*\n([\s\S]*?)(?=\n##|\n```|$)/);
-  const diffMatch = text.match(/## Diff\s*\n```diff\s*\n([\s\S]*?)\n```/);
-  const testResultsMatch = text.match(/## Test results\s*\n([\s\S]*?)(?=\n##|$)/);
-
-  return {
-    summary: (summaryMatch?.[1] || '').trim(),
-    // Strip backticks (and other markdown code ticks) so the branch name is
-    // safe to interpolate into shell commands — without this, backticks in
-    // the agent's `## Branch` output get interpreted as shell command
-    // substitution by bash, e.g. `git checkout -B `fix/review-swarm-abc123``.
-    branch: (branchMatch?.[1] || '').trim().replace(/`/g, ''),
-    diff: (diffMatch?.[1] || '').trim(),
-    subPrUrl: '',
-    testResults: (testResultsMatch?.[1] || '').trim(),
-  };
 }
 
 /**
@@ -530,14 +515,75 @@ const rateLimiter = new RateLimiter();
 /**
  * Call agent.generate() through the rate limiter when useLimiter is set.
  * Without the limiter, calls proceed normally (concurrent).
+ *
+ * The opts object is passed through verbatim — callers can include
+ * maxSteps, structuredOutput, and any other PublicAgentExecutionOptions.
  */
 function generateWithLimit(
   agent: Agent,
   prompt: string,
-  opts?: { maxSteps?: number },
+  opts?: Record<string, unknown>,
 ): Promise<any> {
-  const call = () => (opts ? agent.generate(prompt, opts) : agent.generate(prompt));
+  const call = () => (opts ? agent.generate(prompt, opts as any) : agent.generate(prompt));
   return useLimiter ? rateLimiter.add(call) : call();
+}
+
+/**
+ * Run an agent with tools until it produces a final text answer, then run a
+ * second, tool-free "structuring" call to force that text into the given
+ * schema. Decoupling these two steps avoids the failure mode where a
+ * schema-constrained call is interrupted mid tool-use-loop (e.g. the agent's
+ * last turn is a tool call rather than a final answer, hitting maxSteps
+ * before producing text) — the structuring call always has real text to
+ * work from, since it runs after stage 1 is fully done.
+ *
+ * On structuring failure, returns `fallback` instead of throwing — a single
+ * malformed/empty step should degrade to "no findings" rather than crash
+ * the whole workflow run.
+ */
+async function generateStructured<T>(
+  agent: Agent,
+  prompt: string,
+  schema: z.ZodType<T>,
+  fallback: T,
+  opts?: { maxSteps?: number },
+): Promise<{ value: T; rawText: string }> {
+  // Stage 1: freeform generation with tools, no schema constraint.
+  // Retried on transient upstream failures (idle timeouts, connection drops).
+  const freeform = await generateWithLimitRetrying(agent, prompt, opts, `${agent.name} (stage 1)`);
+  const rawText = freeform.text ?? '';
+
+  if (!rawText.trim()) {
+    console.warn(
+      `[generateStructured] Agent produced no text output (finishReason: ${freeform.finishReason}) — ` +
+      `skipping structuring, using fallback.`,
+    );
+    return { value: fallback, rawText };
+  }
+
+  const structurer = createAgent(
+    `${agent.name}-structurer`,
+    'Extract the requested information from the following text and return it ' +
+      'as structured data matching the schema. Do not add information that is ' +
+      'not present in the text.',
+  );
+
+  try {
+    const structured = await generateWithLimitRetrying(
+      structurer,
+      rawText,
+      { structuredOutput: { schema, jsonPromptInjection: 'auto' } },
+      `${agent.name} (stage 2 structuring)`,
+    );
+    if (!structured.object) {
+      console.warn(`[generateStructured] Structuring returned no object — using fallback.`);
+      return { value: fallback, rawText };
+    }
+    return { value: structured.object as T, rawText };
+  } catch (e: any) {
+    console.warn(`[generateStructured] Structuring failed: ${e.message} — using fallback.`);
+    return { value: fallback, rawText };
+  }
 }
 
 /**
@@ -715,6 +761,102 @@ function executionResult(execution: Execution): CommandRunResult {
 }
 
 /**
+ * Returns true for errors that are worth retrying — transient upstream
+ * issues (timeouts, connection drops, 5xx) rather than genuine failures
+ * (bad request, auth, schema validation). OpenRouter free-tier models in
+ * particular are prone to idle timeouts and dropped connections under load.
+ */
+function isTransientLLMError(e: unknown): boolean {
+  const message = e instanceof Error ? e.message : String(e);
+  return (
+    /idle timeout/i.test(message) ||
+    /timed out/i.test(message) ||
+    /ECONNRESET|ETIMEDOUT|ECONNREFUSED/.test(message) ||
+    /HTTP 5\d\d/.test(message) ||
+    /overloaded|rate.?limit/i.test(message)
+  );
+}
+
+/**
+ * Call agent.generate() (via generateWithLimit) with retry for transient
+ * upstream failures — e.g. "Upstream idle timeout exceeded", which is a
+ * known OpenRouter free-tier flakiness pattern, not a real request error.
+ * Non-transient errors (schema validation, bad request) are NOT retried —
+ * they'd fail identically every time.
+ */
+async function generateWithLimitRetrying(
+  agent: Agent,
+  prompt: string,
+  opts: Record<string, unknown> | undefined,
+  label: string,
+): Promise<any> {
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      return await generateWithLimit(agent, prompt, opts);
+    } catch (e) {
+      lastErr = e;
+      if (!isTransientLLMError(e) || attempt === 3) throw e;
+      const delay = 2000 * attempt;
+      console.warn(
+        `[generateWithLimitRetrying] ${label} failed on attempt ${attempt}/3 ` +
+        `(transient: ${(e as Error).message}) — retrying in ${delay}ms`,
+      );
+      await new Promise((r) => setTimeout(r, delay));
+    }
+  }
+  throw lastErr;
+}
+
+/**
+ * Returns true for errors that are worth retrying — transient upstream
+ * issues (timeouts, connection drops, 5xx) rather than genuine failures
+ * (bad request, auth, schema validation). OpenRouter free-tier models in
+ * particular are prone to idle timeouts and dropped connections under load.
+ */
+function isTransientLLMError(e: unknown): boolean {
+  const message = e instanceof Error ? e.message : String(e);
+  return (
+    /idle timeout/i.test(message) ||
+    /timed out/i.test(message) ||
+    /ECONNRESET|ETIMEDOUT|ECONNREFUSED/.test(message) ||
+    /HTTP 5\d\d/.test(message) ||
+    /overloaded|rate.?limit/i.test(message)
+  );
+}
+
+/**
+ * Call agent.generate() (via generateWithLimit) with retry for transient
+ * upstream failures — e.g. "Upstream idle timeout exceeded", which is a
+ * known OpenRouter free-tier flakiness pattern, not a real request error.
+ * Non-transient errors (schema validation, bad request) are NOT retried —
+ * they'd fail identically every time.
+ */
+async function generateWithLimitRetrying(
+  agent: Agent,
+  prompt: string,
+  opts: Record<string, unknown> | undefined,
+  label: string,
+): Promise<any> {
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      return await generateWithLimit(agent, prompt, opts);
+    } catch (e) {
+      lastErr = e;
+      if (!isTransientLLMError(e) || attempt === 3) throw e;
+      const delay = 2000 * attempt;
+      console.warn(
+        `[generateWithLimitRetrying] ${label} failed on attempt ${attempt}/3 ` +
+        `(transient: ${(e as Error).message}) — retrying in ${delay}ms`,
+      );
+      await new Promise((r) => setTimeout(r, delay));
+    }
+  }
+  throw lastErr;
+}
+
+/**
  * Retry an async operation with linear backoff. Used for the initial
  * git clone, which is the step most exposed to transient sandbox/network
  * hiccups — a single retry here is far cheaper than re-running the whole
@@ -858,86 +1000,66 @@ async function connectSandboxToMcp(tools: ToolsInput, sandboxId: string): Promis
 
 // ── Comment Formatting ───────────────────────────────────────────────────────────
 
-/**
- * A single finding parsed from a reviewer agent's markdown output.
- */
-interface ReviewFinding {
-  severity: 'HIGH' | 'MEDIUM' | 'LOW';
-  /** The raw finding text, e.g. `1. **title** — \`file:line\` — description — suggestion` */
-  rawText: string;
+type Finding = z.infer<typeof FindingSchema>;
+type ReviewerOutput = z.infer<typeof ReviewerStructuredOutputSchema>;
+type RefuteOutput = z.infer<typeof RefuteOutputSchema>;
+
+/** Developer output — extends the schema with subPrUrl (set after git push). */
+interface DeveloperOutput {
+  diff: string;
+  summary: string;
+  branch: string;
+  changedFiles: string[];
+  subPrUrl: string;
+  testResults: string;
 }
 
 /**
- * Parse markdown findings from a reviewer agent into a structured model.
- *
- * The agent returns findings organized by severity:
- *   ## HIGH
- *   1. **title** — `file:line` — description + suggestion
- *   2. ...
- *   ## MEDIUM
- *   ...
- *
- * Falls back to a single uncategorized entry if no severity headers are found.
+ * Format a single finding as markdown for a PR comment.
  */
-function parseReviewerFindings(findings: string): ReviewFinding[] {
-  const result: ReviewFinding[] = [];
-  const lines = findings.split('\n');
-
-  let currentSeverity: 'HIGH' | 'MEDIUM' | 'LOW' | null = null;
-  for (const line of lines) {
-    const headerMatch = line.match(/^## (HIGH|MEDIUM|LOW)$/);
-    if (headerMatch) {
-      currentSeverity = headerMatch[1] as 'HIGH' | 'MEDIUM' | 'LOW';
-      continue;
-    }
-    // Finding lines start with a number + dot, e.g. "1. **title** — ..."
-    if (currentSeverity && line.match(/^\s*\d+\.\s/)) {
-      result.push({ severity: currentSeverity, rawText: line.trim() });
-    }
-  }
-
-  return result;
+function formatFinding(f: Finding): string {
+  return `**${f.title}** — *${f.location}* — ${f.description}\n\nSuggestion: ${f.suggestion}`;
 }
 
 /**
- * Format a reviewer's markdown findings into a PR comment.
+ * Format a reviewer's structured findings into a PR comment.
  *
  * Uses a consistent heading hierarchy: H1 (comment title) → H2 (Summary + severity
- * sections). Findings are parsed from the agent's raw output into a structured model
- * and re-rendered for consistent formatting.
+ * sections). Findings come directly from the schema-constrained agent output —
+ * no regex parsing needed.
  */
-function formatReviewerComment(findings: string, title: string): string {
-  const parsed = parseReviewerFindings(findings);
-
-  if (parsed.length === 0) {
-    // Fallback: wrap raw findings if parsing failed
-    return `# ${title}\n\n${findings}`;
-  }
-
+function formatReviewerComment(findings: ReviewerOutput, title: string): string {
   const counts: Record<string, number> = { HIGH: 0, MEDIUM: 0, LOW: 0 };
-  for (const f of parsed) {
+  for (const f of findings.findings) {
     counts[f.severity]++;
   }
 
   const parts: string[] = [
     `# ${title}`,
-    `## Summary\n${parsed.length} finding(s): ${counts.HIGH}H / ${counts.MEDIUM}M / ${counts.LOW}L`,
+    `## Summary\n${findings.findings.length} finding(s): ${counts.HIGH}H / ${counts.MEDIUM}M / ${counts.LOW}L`,
   ];
 
   for (const severity of ['HIGH', 'MEDIUM', 'LOW'] as const) {
-    const sectionFindings = parsed.filter((f) => f.severity === severity);
+    const sectionFindings = findings.findings.filter((f) => f.severity === severity);
     if (sectionFindings.length === 0) continue;
-    parts.push(`## ${severity}\n${sectionFindings.map((f) => f.rawText).join('\n')}`);
+    parts.push(`## ${severity}\n${sectionFindings.map(formatFinding).join('\n\n')}`);
   }
 
   return parts.join('\n\n');
 }
 
 /**
- * Format the refuter's output into a PR comment.
+ * Format the refuter's structured output into a PR comment.
  */
-function formatRefutedComment(findings: string): string {
-  return `# Findings Summary\n\n${findings}`;
+function formatRefutedComment(refuteResult: RefuteOutput): string {
+  const acceptedLines = refuteResult.accepted
+    .map((f) => `**${f.severity}** — ${f.title} — ${f.location}`)
+    .join('\n');
+  const rejectedLines = refuteResult.rejected
+    .map((f) => `**${f.severity}** — ${f.title} — ${f.location} — _rejected: ${f.reason}_`)
+    .join('\n');
+
+  return `# Findings Summary\n\n## Accepted (${refuteResult.accepted.length})\n${acceptedLines || '_None_'}\n\n## Rejected (${refuteResult.rejected.length})\n${rejectedLines || '_None_'}`;
 }
 
 /**
@@ -958,6 +1080,53 @@ function formatChangesetComment(
   return `# Fix Applied\n\n**Branch:** \`${branch}\`\n\n**Summary:** ${summary}\n\n## Diff\n\`\`\`diff\n${diff.slice(0, 3000)}\n\`\`\`\n\n## Sub-PR\n${subPrUrl}${testSection}`;
 }
 
+/**
+ * Format all three reviewers' structured findings into a single text prompt
+ * for the refuter agent.
+ */
+function formatFindingsForRefuter(
+  security: ReviewerOutput,
+  performance: ReviewerOutput,
+  quality: ReviewerOutput,
+): string {
+  return [
+    '## Security Review',
+    formatReviewerFindingsForRefuter(security.findings),
+    '## Performance Review',
+    formatReviewerFindingsForRefuter(performance.findings),
+    '## Code Quality Review',
+    formatReviewerFindingsForRefuter(quality.findings),
+  ].join('\n\n');
+}
+
+/**
+ * Helper: format an array of findings as numbered markdown lines.
+ */
+function formatReviewerFindingsForRefuter(findings: Finding[]): string {
+  if (findings.length === 0) return '_No findings._';
+  return findings
+    .map(
+      (f, i) =>
+        `${i + 1}. **${f.severity}** — ${f.title} — *${f.location}* — ${f.description}\n   Suggestion: ${f.suggestion}`,
+    )
+    .join('\n');
+}
+
+/**
+ * Format the accepted findings from the refuter into a task string for the
+ * developer agent.
+ */
+function formatAcceptedFindingsForDeveloper(accepted: Finding[]): string {
+  if (accepted.length === 0) return '## Accepted Findings\n\nNo accepted findings — no fixes needed.';
+  const items = accepted
+    .map(
+      (f) =>
+        `- **${f.severity}** — ${f.title} — *${f.location}* — ${f.description}\n  Suggestion: ${f.suggestion}`,
+    )
+    .join('\n\n');
+  return `## Accepted Findings\n\nYou must implement fixes for the following findings:\n\n${items}`;
+}
+
 // ── Mastra Workflow ───────────────────────────────────────────────────────────
 
 const InputSchema = z.object({
@@ -969,16 +1138,43 @@ const InputSchema = z.object({
 
 const OutputSchema = z.object({ status: z.string() });
 
-const ReviewOutputSchema = z.object({ result: z.string() });
+/** Single finding from a reviewer agent. */
+const FindingSchema = z.object({
+  severity: z.enum(['HIGH', 'MEDIUM', 'LOW']),
+  title: z.string(),
+  location: z.string().describe('e.g. file.ts:42'),
+  description: z.string(),
+  suggestion: z.string(),
+});
+
+/** Reviewer structured output — replaces ## HIGH/MEDIUM/LOW markdown format. */
+const ReviewerStructuredOutputSchema = z.object({
+  findings: z.array(FindingSchema),
+});
+
+/** Refuter output — accepted and rejected findings with rejection reasons. */
+const RefuteOutputSchema = z.object({
+  accepted: z.array(FindingSchema),
+  rejected: z.array(
+    FindingSchema.extend({ reason: z.string() }),
+  ),
+});
+
+/** Developer structured output — replaces ## Summary/Branch/Diff/Test results. */
+const DeveloperStructuredOutputSchema = z.object({
+  summary: z.string(),
+  branch: z.string(),
+  diff: z.string(),
+  testResults: z.string(),
+  changedFiles: z.array(z.string()),
+});
+
+const ReviewOutputSchema = z.object({
+  result: ReviewerStructuredOutputSchema,
+});
 
 const DevelopOutputSchema = z.object({
-  result: z.object({
-    diff: z.string(),
-    summary: z.string(),
-    branch: z.string().optional(),
-    subPrUrl: z.string(),
-    testResults: z.string(),
-  }),
+  result: DeveloperStructuredOutputSchema,
 });
 
 /**
@@ -1028,7 +1224,12 @@ function createAgent(name: string, instructions: string, tools?: ToolsInput): Ag
  * needs to analyze the code. cleanupSandboxes() handles destruction — the
  * agent never creates or destroys sandboxes itself.
  */
-async function runReviewer(instructions: string, task: string, repository: string, headRef: string): Promise<string> {
+async function runReviewer(
+  instructions: string,
+  task: string,
+  repository: string,
+  headRef: string,
+): Promise<z.infer<typeof ReviewerStructuredOutputSchema>> {
   const mcp = createMcpClient();
   const sandbox = await createSandbox();
   const taskWithSandbox = `${task}\n\nSANDBOX_ID: ${sandbox.id}`;
@@ -1038,22 +1239,22 @@ async function runReviewer(instructions: string, task: string, repository: strin
     await connectSandboxToMcp(tools, sandbox.id);
     await setupSandbox(sandbox, repository, headRef);
     const agent = createAgent('reviewer', instructions, tools);
-    const result = await generateWithLimit(agent, taskWithSandbox, { maxSteps: 50 });
+
+    const { value, rawText } = await generateStructured(
+      agent,
+      taskWithSandbox,
+      ReviewerStructuredOutputSchema,
+      { findings: [] },
+      { maxSteps: 50 },
+    );
+
     if (process.env.DEBUG_MCP) {
-      console.log(`[runReviewer] result.text: ${JSON.stringify(result.text?.slice(0, 200))}`);
-      console.log(`[runReviewer] result.steps.length: ${result.steps?.length ?? 'N/A'}`);
-      console.log(`[runReviewer] result.toolCalls: ${JSON.stringify(result.toolCalls?.length ?? 0)}`);
-      console.log(`[runReviewer] result.toolResults: ${JSON.stringify(result.toolResults?.length ?? 0)}`);
-      console.log(`[runReviewer] result.finishReason: ${result.finishReason}`);
+      console.log(`[runReviewer] rawText (first 300 chars): ${rawText.slice(0, 300)}`);
+      console.log(`[runReviewer] structured findings: ${JSON.stringify(value)}`);
     }
-    return result.text;
+    return value;
   } finally {
     await mcp.disconnect();
-    // Reviewer sandbox is no longer needed — kill it immediately to free
-    // CPU/memory for the remaining reviewers and the developer step.
-    // This is critical under the default resource limits (1 CPU / 2Gi) —
-    // keeping 4 sandboxes alive simultaneously causes contention that
-    // can make git operations hang and get killed by the timeout.
     await killSandbox(sandbox);
   }
 }
@@ -1082,29 +1283,24 @@ async function runDeveloper(
     await connectSandboxToMcp(tools, sandbox.id);
     await setupSandbox(sandbox, repository, headRef);
     const agent = createAgent('developer', instructions, tools);
-    const result = await generateWithLimit(agent, taskWithSandbox, { maxSteps: 50 });
-    // Always log key diagnostics — the developer's output is parsed structurally,
-    // so empty/blocked output is a silent failure that must always surface.
-    console.log(`[runDeveloper] result.text (first 500 chars): ${result.text?.slice(0, 500)}`);
-    console.log(`[runDeveloper] result.finishReason: ${result.finishReason}`);
-    console.log(`[runDeveloper] result.toolCalls: ${result.toolCalls?.length ?? 0}`);
-    if (process.env.DEBUG_MCP) {
-      console.log(`[runDeveloper] result.text: ${JSON.stringify(result.text?.slice(0, 500))}`);
-      console.log(`[runDeveloper] result.steps.length: ${result.steps?.length ?? 'N/A'}`);
-      console.log(`[runDeveloper] result.toolResults: ${JSON.stringify(result.toolResults?.length ?? 0)}`);
-    }
-    const output = parseDeveloperOutput(result.text || '');
 
-    // Warn when the agent hit the step limit — its final action may have been
-    // a tool call, meaning the structured output (## Summary, ## Branch, etc.)
-    // was never produced. The fallback branch generator will still create a
-    // branch, but the diff/summary/testResults will be empty.
-    if (result.finishReason === 'tool-calls' && !output.summary) {
-      console.warn(
-        `[runDeveloper] WARNING: Agent hit step limit (finishReason: tool-calls) — ` +
-        `output may be incomplete. Consider increasing maxSteps or using --limiter.`,
-      );
-    }
+    const { value: obj, rawText } = await generateStructured(
+      agent,
+      taskWithSandbox,
+      DeveloperStructuredOutputSchema,
+      { summary: '', branch: '', diff: '', testResults: '', changedFiles: [] },
+      { maxSteps: 50 },
+    );
+
+
+    const output: DeveloperOutput = {
+      diff: obj.diff,
+      summary: obj.summary,
+      branch: obj.branch,
+      changedFiles: obj.changedFiles,
+      subPrUrl: '',
+      testResults: obj.testResults,
+    };
 
     // Commit and push the fix via git in the sandbox, then create a sub-PR.
     // If the agent copied the literal placeholder (xxxxxxxx), generate a real branch name.
@@ -1176,27 +1372,27 @@ const codeQualityReviewStep = createStep({
  * Refute findings step: no MCPClient (pure analysis), examines all 3 review
  * sets of findings, filters false positives, returns markdown summary.
  */
+const RefuteResultSchema = z.object({ result: RefuteOutputSchema });
+
 const refuteStep = createStep({
   id: 'refute_findings',
   inputSchema: ParallelReviewOutputSchema,
-  outputSchema: ReviewOutputSchema,
+  outputSchema: RefuteResultSchema,
   execute: async ({ getStepResult }) => {
-    const security = getStepResult<{ result: string }>('security_review');
-    const performance = getStepResult<{ result: string }>('performance_review');
-    const quality = getStepResult<{ result: string }>('code_quality_review');
+    const security = getStepResult<{ result: z.infer<typeof ReviewerStructuredOutputSchema> }>('security_review');
+    const performance = getStepResult<{ result: z.infer<typeof ReviewerStructuredOutputSchema> }>('performance_review');
+    const quality = getStepResult<{ result: z.infer<typeof ReviewerStructuredOutputSchema> }>('code_quality_review');
 
-    const combined = [
-      '## Security Review',
-      security.result,
-      '## Performance Review',
-      performance.result,
-      '## Code Quality Review',
-      quality.result,
-    ].join('\n\n');
+    const combined = formatFindingsForRefuter(security.result, performance.result, quality.result);
 
     const agent = createAgent('refuter', REFUTER_INSTRUCTION);
-    const result = await generateWithLimit(agent, combined);
-    return { result: result.text };
+    const { value } = await generateStructured(
+      agent,
+      combined,
+      RefuteOutputSchema,
+      { accepted: [], rejected: [] },
+    );
+    return { result: value };
   },
 });
 
@@ -1207,12 +1403,12 @@ const refuteStep = createStep({
  */
 const developStep = createStep({
   id: 'develop_fix',
-  inputSchema: ReviewOutputSchema,
+  inputSchema: RefuteResultSchema,
   outputSchema: DevelopOutputSchema,
   execute: async ({ getInitData, getStepResult }) => {
     const initData = getInitData<{ repository: string; prNumber: number; task: string; headRef: string }>();
-    const refuted = getStepResult<{ result: string }>('refute_findings');
-    const task = `${initData.task}\n\n## Refuted Findings\n\n${refuted.result}`;
+    const refuted = getStepResult<{ result: z.infer<typeof RefuteOutputSchema> }>('refute_findings');
+    const task = `${initData.task}\n\n${formatAcceptedFindingsForDeveloper(refuted.result.accepted)}`;
     const result = await runDeveloper(DEVELOPER_INSTRUCTION, task, initData.repository, initData.headRef, initData.prNumber);
     return { result };
   },
@@ -1253,28 +1449,27 @@ interface StepResultEvent {
 }
 
 /**
- * Robustly extract the step result text from a `workflow-step-result` event.
+ * Robustly extract structured output from a `workflow-step-result` event.
  *
- * The step outputs (`{ result: "..." }`) are expected at `event.payload.output`,
- * but we defensively try several possible locations so that a schema-shape
- * mismatch never silently produces a header-only comment.
+ * The step outputs (`{ result: <structured object> }`) are expected at
+ * `event.payload.output`, but we defensively try several possible locations
+ * so that a schema-shape mismatch never silently produces a header-only comment.
  *
  * Extraction order:
  *   1. `payload.output.result` — the canonical shape for our steps
  *   2. `payload.payload` — some Mastra internals nest the output under `payload`
- *   3. `payload.output` as a bare string
  *
- * Returns `undefined` when no usable text is found.
+ * Returns `undefined` when no usable result is found.
  */
-function extractStepResultText(event: StepResultEvent): string | undefined {
+function extractStepResult<T>(event: StepResultEvent): T | undefined {
   const payload = event.payload;
 
-  // 1. Canonical shape: { result: "..." }
+  // 1. Canonical shape: { result: <structured object> }
   const output = payload.output;
   if (output && typeof output === 'object') {
     const result = (output as Record<string, any>).result;
     if (result !== undefined && result !== null) {
-      return typeof result === 'string' ? result : undefined;
+      return result as T;
     }
   }
 
@@ -1283,13 +1478,8 @@ function extractStepResultText(event: StepResultEvent): string | undefined {
   if (innerPayload && typeof innerPayload === 'object') {
     const result = (innerPayload as Record<string, any>).result;
     if (result !== undefined && result !== null) {
-      return typeof result === 'string' ? result : undefined;
+      return result as T;
     }
-  }
-
-  // 3. Last resort: output itself is a string
-  if (typeof output === 'string') {
-    return output;
   }
 
   return undefined;
@@ -1337,34 +1527,55 @@ async function handleStepCompletion(
     return;
   }
 
-  const findings = extractStepResultText(event);
-
-  if (debug) {
-    if (!findings || findings.trim() === '') {
-      console.log(`  [WARN] No findings text extracted for step '${stepId}'.`);
-      console.log(`  event.payload.output:`, JSON.stringify(event.payload?.output));
-      console.log(`  event.payload.payload:`, JSON.stringify(event.payload?.payload));
-    } else {
-      console.log(`  Findings length: ${findings.length} chars`);
-    }
-  }
-
-  if (!findings || findings.trim() === '') {
-    console.error(
-      `handleStepCompletion: step '${stepId}' completed successfully but ` +
-      `no findings text was extracted. Skipping comment to avoid a header-only post.`,
-    );
-    return;
-  }
-
   if (stepId === 'security_review') {
+    const findings = extractStepResult<ReviewerOutput>(event);
+    if (!findings || findings.findings.length === 0) {
+      console.error(
+        `handleStepCompletion: step '${stepId}' completed successfully but ` +
+        `no findings extracted. Skipping comment to avoid a header-only post.`,
+      );
+      return;
+    }
+    if (debug) {
+      console.log(`  Findings count: ${findings.findings.length}`);
+    }
     await postPrComment(repository, prNumber, formatReviewerComment(findings, 'Security Review'));
   } else if (stepId === 'performance_review') {
+    const findings = extractStepResult<ReviewerOutput>(event);
+    if (!findings || findings.findings.length === 0) {
+      console.error(
+        `handleStepCompletion: step '${stepId}' completed successfully but ` +
+        `no findings extracted. Skipping comment to avoid a header-only post.`,
+      );
+      return;
+    }
+    if (debug) {
+      console.log(`  Findings count: ${findings.findings.length}`);
+    }
     await postPrComment(repository, prNumber, formatReviewerComment(findings, 'Performance Review'));
   } else if (stepId === 'code_quality_review') {
+    const findings = extractStepResult<ReviewerOutput>(event);
+    if (!findings || findings.findings.length === 0) {
+      console.error(
+        `handleStepCompletion: step '${stepId}' completed successfully but ` +
+        `no findings extracted. Skipping comment to avoid a header-only post.`,
+      );
+      return;
+    }
+    if (debug) {
+      console.log(`  Findings count: ${findings.findings.length}`);
+    }
     await postPrComment(repository, prNumber, formatReviewerComment(findings, 'Code Quality Review'));
   } else if (stepId === 'refute_findings') {
-    await postPrComment(repository, prNumber, formatRefutedComment(findings));
+    const refuteResult = extractStepResult<RefuteOutput>(event);
+    if (!refuteResult) {
+      console.error(
+        `handleStepCompletion: step '${stepId}' completed successfully but ` +
+        `no refute result extracted. Skipping comment.`,
+      );
+      return;
+    }
+    await postPrComment(repository, prNumber, formatRefutedComment(refuteResult));
   }
 }
 
@@ -1424,12 +1635,16 @@ async function main() {
   useLimiter = args.limiter;
   if (useLimiter) console.log(`Rate limiter enabled — 1 request per 3 seconds.`);
 
-  // 1. Minimize old bot comments from previous runs
-  await minimizeOldComments(args.repository, args.prNumber);
-
-  // 2. Fetch PR context (diff, changed files, metadata)
+  // 1. Fetch PR context (diff, changed files, metadata) — validates the PR exists
   const ctx = await getPrContext(args.repository, args.prNumber);
   console.log(`PR #${args.prNumber}: "${ctx.title}" head=${ctx.headRef}`);
+
+  // 2. Minimize old bot comments from previous runs (best-effort — skip on failure)
+  try {
+    await minimizeOldComments(args.repository, args.prNumber);
+  } catch (e: any) {
+    console.warn(`[warn] Failed to minimate old comments: ${e.message} — continuing anyway`);
+  }
 
   // 3. Build the task string with full context for the agents
   const changedFilesStr = ctx.changedFiles.length > 0
@@ -1471,7 +1686,7 @@ ${changedFilesStr}
     });
 
     // 5. Stream events — post PR comments as each step completes
-    for await (const event of workflowStream) {
+    for await (const event of workflowStream.fullStream) {
       if (event.type === 'workflow-step-result') {
         if (args.debug) {
           console.log('workflow-step-result event:', JSON.stringify(event, null, 2));
