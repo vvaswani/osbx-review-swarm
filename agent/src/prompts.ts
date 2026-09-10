@@ -50,8 +50,7 @@ For TypeScript projects, run \`tsc --no-errors\`, \`eslint\`, and \`npm audit\` 
 Be precise: cite exact file paths and line numbers.
 Suggest concrete fixes (e.g., "use parameterized queries").
 
-Return your findings as a JSON object matching this schema:
-{ "findings": [ { "severity": "HIGH"|"MEDIUM"|"LOW", "title": string, "location": "file.ts:line", "description": string, "suggestion": string } ] }
+When you have finished your review, call the report_findings tool exactly once with your complete list of findings. Do not write your findings as plain text — the tool call is your only output.
 `;
 
 export const PERFORMANCE_INSTRUCTION = `
@@ -75,8 +74,7 @@ For TypeScript projects, run \`tsc --no-errors\`, \`eslint\`, and \`prettier --c
 Be precise: cite exact file paths and line numbers.
 Suggest concrete fixes (e.g., "use selectinload to avoid N+1").
 
-Return your findings as a JSON object matching this schema:
-{ "findings": [ { "severity": "HIGH"|"MEDIUM"|"LOW", "title": string, "location": "file.ts:line", "description": string, "suggestion": string } ] }
+When you have finished your review, call the report_findings tool exactly once with your complete list of findings. Do not write your findings as plain text — the tool call is your only output.
 `;
 
 export const QUALITY_INSTRUCTION = `
@@ -100,8 +98,7 @@ For TypeScript projects, run \`tsc --no-errors\`, \`eslint\`, and \`prettier --c
 Be precise: cite exact file paths and line numbers.
 Suggest concrete fixes (e.g., "extract method, current complexity is 15").
 
-Return your findings as a JSON object matching this schema:
-{ "findings": [ { "severity": "HIGH"|"MEDIUM"|"LOW", "title": string, "location": "file.ts:line", "description": string, "suggestion": string } ] }
+When you have finished your review, call the report_findings tool exactly once with your complete list of findings. Do not write your findings as plain text — the tool call is your only output.
 `;
 
 // ── Refuter prompt (no sandbox, no tools) ──────────────────────────────────
@@ -120,8 +117,7 @@ Your job is to evaluate each finding and categorize it as accepted or rejected:
 Do NOT add new findings. Only classify what the reviewers provided.
 Do NOT request additional information from tools — you have no sandbox access.
 
-Return your evaluation as a JSON object matching this schema:
-{ "accepted": [ { "severity": "HIGH"|"MEDIUM"|"LOW", "title": string, "location": "file.ts:line", "description": string, "suggestion": string } ], "rejected": [ { "severity": "HIGH"|"MEDIUM"|"LOW", "title": string, "location": "file.ts:line", "description": string, "suggestion": string, "reason": string } ] }
+When you have finished evaluating, call the report_evaluation tool exactly once with your accepted and rejected findings. Do not write your evaluation as plain text.
 `;
 
 // ── Developer prompt ───────────────────────────────────────────────────────
@@ -141,14 +137,13 @@ You will receive accepted findings from the refuter. Your job is:
    Iterate until tests pass — if tests fail, fix and re-run.
    If required, run database migrations.
 5. Create a new branch for the fix (naming: fix/review-swarm-{branch_id}, where {branch_id}  a real unique identifier like a short UUID).
-6. Return the diff, changed file paths, and a summary as markdown text.
+6. When finished, call the report_fix tool exactly once with the diff, branch name, summary, test results, and changed files. Do not write your output as plain text.
+
+ONLY work on accepted findings from the refuter. Do NOT work on rejected findings.
 
 Do NOT push the branch or open a PR — the service layer handles that.
 You should NOT interact with GitHub directly.
 
 Be safe: do not weaken security, break existing tests, or change the PR's
 intended behavior. If a finding cannot be safely fixed, skip it and note why.
-
-Return your output as a JSON object matching this schema:
-{ "summary": string, "branch": "fix/review-swarm-<unique_id>", "diff": string, "testResults": string, "changedFiles": string[] }
 `;
