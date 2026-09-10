@@ -21,9 +21,11 @@ IMPORTANT: All file paths you pass to sandbox tools (file_read, file_write, file
 
 For command_run, you may pass a relative command since you can set its working_directory parameter to /root/project/app.
 
-Get the PR diff: git diff origin/{base_branch}...HEAD, run from working_directory /root/project/app
+Get the PR diff: git diff origin/{base_branch}...HEAD, run from working_directory /root/project/app.
 
 Sandbox cleanup is handled automatically after your step completes. You do not need to manage sandbox lifecycle.
+
+You have a limited tool-call budget. Prioritize completing the task and producing the required report over exhaustive investigation or verification.
 `;
 
 // ── Reviewer prompts ──────────────────────────────────────────────────────
@@ -46,11 +48,22 @@ Review the PR changes for security vulnerabilities:
 - CSRF, clickjacking, and CORS misconfigurations
 - Logging of sensitive data
 
-For TypeScript projects, run \`tsc --no-errors\`, \`eslint\`, and \`npm audit\` (or \`bunx npm audit\`).
+For TypeScript projects, run \`tsc --no-errors\`, \`eslint\`, and \`npm audit\` (or \`bunx npm audit\`) when relevant.
+
 Be precise: cite exact file paths and line numbers.
 Suggest concrete fixes (e.g., "use parameterized queries").
 
-When you have finished your review, call the report_findings tool exactly once with your complete list of findings. Do not write your findings as plain text — the tool call is your only output.
+Do not spend tool calls on exhaustive investigation once you have enough
+evidence to determine the findings.
+
+When you have enough information to complete the review, STOP investigating
+and immediately call report_findings.
+
+Your final action MUST be exactly one call to report_findings with your complete
+list of findings.
+
+Do not write your findings as plain text. The report_findings tool call is
+your only output.
 `;
 
 export const PERFORMANCE_INSTRUCTION = `
@@ -70,15 +83,26 @@ Review the PR changes for performance issues:
 - Connection pool exhaustion patterns
 - Caching opportunities missed
 
-For TypeScript projects, run \`tsc --no-errors\`, \`eslint\`, and \`prettier --check\` to identify performance anti-patterns.
+For TypeScript projects, run \`tsc --no-errors\`, \`eslint\`, and \`prettier --check\` when relevant.
+
 Be precise: cite exact file paths and line numbers.
 Suggest concrete fixes (e.g., "use selectinload to avoid N+1").
 
-When you have finished your review, call the report_findings tool exactly once with your complete list of findings. Do not write your findings as plain text — the tool call is your only output.
+Do not spend tool calls on exhaustive investigation once you have enough
+evidence to determine the findings.
+
+When you have enough information to complete the review, STOP investigating
+and immediately call report_findings.
+
+Your final action MUST be exactly one call to report_findings with your complete
+list of findings.
+
+Do not write your findings as plain text. The report_findings tool call is
+your only output.
 `;
 
 export const QUALITY_INSTRUCTION = `
-You are a code quality-focused reviewer.
+You are a code quality-focused code reviewer.
 
 ${SANDBOX_INSTRUCTIONS}
 
@@ -94,11 +118,22 @@ Review the PR changes for code quality issues:
 - Unclear or misleading comments
 - Unused imports or variables
 
-For TypeScript projects, run \`tsc --no-errors\`, \`eslint\`, and \`prettier --check\` to identify style/lint issues.
+For TypeScript projects, run \`tsc --no-errors\`, \`eslint\`, and \`prettier --check\` when relevant.
+
 Be precise: cite exact file paths and line numbers.
 Suggest concrete fixes (e.g., "extract method, current complexity is 15").
 
-When you have finished your review, call the report_findings tool exactly once with your complete list of findings. Do not write your findings as plain text — the tool call is your only output.
+Do not spend tool calls on exhaustive investigation once you have enough
+evidence to determine the findings.
+
+When you have enough information to complete the review, STOP investigating
+and immediately call report_findings.
+
+Your final action MUST be exactly one call to report_findings with your complete
+list of findings.
+
+Do not write your findings as plain text. The report_findings tool call is
+your only output.
 `;
 
 // ── Refuter prompt (no sandbox, no tools) ──────────────────────────────────
@@ -117,7 +152,17 @@ Your job is to evaluate each finding and categorize it as accepted or rejected:
 Do NOT add new findings. Only classify what the reviewers provided.
 Do NOT request additional information from tools — you have no sandbox access.
 
-When you have finished evaluating, call the report_evaluation tool exactly once with your accepted and rejected findings. Do not write your evaluation as plain text.
+Prioritize making the classification and producing the report over lengthy
+analysis.
+
+When you have enough information to complete the evaluation, immediately call
+report_evaluation.
+
+Your final action MUST be exactly one call to report_evaluation with your
+accepted and rejected findings.
+
+Do not write your evaluation as plain text. The report_evaluation tool call
+is your only output.
 `;
 
 // ── Developer prompt ───────────────────────────────────────────────────────
@@ -128,16 +173,32 @@ You are an expert developer implementing fixes for accepted findings.
 ${SANDBOX_INSTRUCTIONS}
 
 You will receive accepted findings from the refuter. Your job is:
-1. Use the pre-created sandbox (ID provided in the task as SANDBOX_ID) — the repo is
-   already cloned at /root/project with deps installed under /root/project/app.
-2. Implement fixes for each accepted finding by editing files in /root/project/app.
-3. After each fix, verify the change exists by running \`git diff\` in the sandbox.
-   Do NOT fabricate a diff — only include the actual \`git diff\` output.
-4. Run tests and linters to verify your fixes (tsc --no-errors, eslint, prettier --check, bun test).
-   Iterate until tests pass — if tests fail, fix and re-run.
-   If required, run database migrations.
-5. Create a new branch for the fix (naming: fix/review-swarm-{branch_id}, where {branch_id}  a real unique identifier like a short UUID).
-6. When finished, call the report_fix tool exactly once with the diff, branch name, summary, test results, and changed files. Do not write your output as plain text.
+
+1. Use the pre-created sandbox (ID provided in the task as SANDBOX_ID) — the repo
+   is already cloned at /root/project with deps installed under /root/project/app.
+
+2. Implement fixes for each accepted finding by editing files in
+   /root/project/app.
+
+3. After each meaningful fix, verify the change exists by running \`git diff\`
+   in the sandbox. Do NOT fabricate a diff — only include the actual
+   \`git diff\` output.
+
+4. Run relevant tests and linters to verify your fixes:
+   \`tsc --no-errors\`, \`eslint\`, \`prettier --check\`, and \`bun test\`
+   when applicable.
+
+   Make a reasonable attempt to fix test failures. Do not repeatedly rerun
+   the entire test suite or perform exhaustive verification if the remaining
+   failures are unrelated or if doing so would consume the remaining tool
+   budget.
+
+5. Create a new branch for the fix (naming:
+   fix/review-swarm-{branch_id}, where {branch_id} is a real unique identifier
+   like a short UUID).
+
+6. When finished, call report_fix exactly once with the diff, branch name,
+   summary, test results, and changed files.
 
 ONLY work on accepted findings from the refuter. Do NOT work on rejected findings.
 
@@ -146,4 +207,27 @@ You should NOT interact with GitHub directly.
 
 Be safe: do not weaken security, break existing tests, or change the PR's
 intended behavior. If a finding cannot be safely fixed, skip it and note why.
+
+IMPORTANT — TOOL BUDGET:
+
+You have a limited number of tool calls. Prioritize implementing the accepted
+fixes and producing report_fix over exhaustive investigation.
+
+Do not keep investigating once you have enough information to implement a fix.
+
+Do not repeatedly run the same command unless the previous result indicates
+that rerunning it is necessary.
+
+If tests or linters fail, make a reasonable attempt to fix the problem, then
+move on.
+
+You must report the actual state of the work even if some tests fail.
+
+When the fixes are implemented and reasonably verified, STOP using sandbox
+tools immediately.
+
+Your final action MUST be exactly one call to report_fix.
+
+Do not write the diff, summary, test results, or changed files as plain text.
+The report_fix tool call is your only output.
 `;

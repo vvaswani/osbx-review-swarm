@@ -515,6 +515,64 @@ async function generateWithRetry(
   throw lastErr;
 }
 
+/**
+ * Rough token estimate — good enough for a truncation budget, not exact.
+ * ~4 chars/token is a standard approximation for English/code text.
+ */
+function estimateTokens(text: string): number {
+  return Math.ceil(text.length / 4);
+}
+
+/**
+ * Cap the total size of phase-1 messages carried into the forced call.
+ * Tool results (file reads, npm audit/eslint output) can be huge; without
+ * a cap, threading the full trace risks exceeding the model's context
+ * window entirely (seen in practice: a 1,048,576-token Gemini limit
+ * exceeded from an uncapped forced-call prompt).
+ *
+ * Strategy: keep messages starting from the END (most recent tool calls
+ * are usually most relevant to "what did you just find"), dropping older
+ * ones once the budget is exhausted. Truncate any individual oversized
+ * message's content rather than dropping it outright, so at least a
+ * summary survives.
+ */
+function capMessagesToBudget(messages: any[], maxTokens: number): any[] {
+  const kept: any[] = [];
+  let used = 0;
+
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+
+    const content =
+      typeof msg.content === 'string'
+        ? msg.content
+        : JSON.stringify(msg.content ?? '');
+
+    const tokens = estimateTokens(content);
+
+    if (used + tokens > maxTokens) {
+      const remaining = maxTokens - used;
+
+      if (remaining > 200) {
+        const truncatedChars = remaining * 4;
+
+        kept.unshift({
+          ...msg,
+          content:
+            content.slice(0, truncatedChars) +
+            '\n...[truncated]',
+        });
+      }
+
+      break;
+    }
+
+    kept.unshift(msg);
+    used += tokens;
+  }
+
+  return kept;
+}
 
 /**
  * Build a local, in-process "reporting" tool whose input schema is the
@@ -559,55 +617,113 @@ async function generateWithReportTool<T>(
   opts: { maxSteps?: number },
   label: string,
 ): Promise<{ value: T; finishReason: string }> {
+  // Phase 1: let the agent do its normal investigation/work.
   const result = await generateWithRetry(agent, prompt, opts, label);
-  let captured = reportTool.getResult();
 
-  if (captured === undefined) {
-    console.log(`[generateWithReportTool] ${label} — running guaranteed forced report step (finishReason was: ${result.finishReason}).`);
+  // Normal path — the agent successfully reported its result.
+  const captured = reportTool.getResult();
 
-    const rawPhase1Messages = result.response?.messages ?? [];
-    // Budget: ~100k tokens for the carried-forward trace, leaving headroom
-    // for the model's own response and tool schemas. Adjust per model if
-    // needed — this is deliberately conservative, not tuned to any one
-    // provider's actual context window.
-    const phase1Messages = capMessagesToBudget(rawPhase1Messages, 100_000);
-    if (phase1Messages.length < rawPhase1Messages.length) {
-      console.warn(
-        `[generateWithReportTool] ${label} — truncated phase-1 history from ` +
-        `${rawPhase1Messages.length} to ${phase1Messages.length} messages to fit token budget.`,
-      );
-    }
-    if (rawPhase1Messages.length === 0) {
-      console.warn(`[generateWithReportTool] ${label} — no phase-1 messages found to carry forward.`);
-    }
-
-    const forcedMessages = [
-      { role: 'user' as const, content: prompt },
-      ...phase1Messages,
-      { role: 'user' as const, content: `Call ${reportTool.id} now with your complete results, based on the work you already did above.` },
-    ];
-
-    try {
-      const forcedResult = await generateWithRetry(
-        agent,
-        forcedMessages,
-        { ...opts, maxSteps: 1, toolChoice: { type: 'tool', toolName: reportTool.id } },
-        `${label} (forced)`,
-      );
-      captured = reportTool.getResult();
-      if (captured === undefined) {
-        console.warn(`[generateWithReportTool] ${label} forced call still failed to report — using fallback.`);
-        console.warn(`[generateWithReportTool] ${label} forced call finishReason: ${forcedResult.finishReason}, text: ${forcedResult.text?.slice(0, 500)}, toolCalls: ${JSON.stringify(forcedResult.toolCalls)}`);
-      }
-    } catch (e) {
-      // Non-transient failures (e.g. token-limit exceeded) previously
-      // propagated uncaught and could crash the whole step/run. Catch here
-      // and fall back gracefully — a degraded result beats a crashed run.
-      console.error(`[generateWithReportTool] ${label} forced call threw — using fallback.`, e);
-    }
+  if (captured !== undefined) {
+    return {
+      value: captured,
+      finishReason: result.finishReason,
+    };
   }
 
-  return { value: captured ?? fallback, finishReason: result.finishReason };
+  // Recovery path — the agent finished without calling the report tool.
+  console.warn(
+    `[generateWithReportTool] ${label} — agent did not call ${reportTool.id}; ` +
+    `running recovery report call.`,
+  );
+
+  /*
+   * Preserve the phase-1 conversation so the recovery call can see the work
+   * the agent already performed.
+   *
+   * Keep only the most recent messages and cap the total size. This avoids
+   * resending the entire conversation when a long tool-using run hits
+   * maxSteps.
+   */
+    const rawMessages = result.response?.messages ?? [];
+
+    const MAX_RECOVERY_MESSAGES = 20;
+    const MAX_RECOVERY_TOKENS = 10_000;
+
+    const recoveryMessages = capMessagesToBudget(
+      rawMessages.slice(-MAX_RECOVERY_MESSAGES),
+      MAX_RECOVERY_TOKENS,
+    );
+
+    console.warn(
+      `[generateWithReportTool] ${label} — recovery context: ` +
+      `${recoveryMessages.length} messages.`,
+    );
+
+  const recoveryPrompt = [
+    {
+      role: 'user' as const,
+      content:
+        `You already completed the task above. Do not perform any more investigation ` +
+        `or use any other tools. Based on the work you already completed, immediately ` +
+        `call ${reportTool.id} with the best complete result you can produce. ` +
+        `This must be your only action.`,
+    },
+  ];
+
+  try {
+    const recoveryResult = await generateWithRetry(
+      agent,
+      [
+        ...recoveryMessages,
+        ...recoveryPrompt,
+      ],
+      {
+        ...opts,
+        maxSteps: 1,
+        toolChoice: {
+          type: 'tool',
+          toolName: reportTool.id,
+        },
+      },
+      `${label} (recovery)`,
+    );
+
+    const recovered = reportTool.getResult();
+
+    if (recovered !== undefined) {
+      console.log(
+        `[generateWithReportTool] ${label} — recovery successfully captured ${reportTool.id}.`,
+      );
+
+      return {
+        value: recovered,
+        finishReason: result.finishReason,
+      };
+    }
+
+    console.warn(
+      `[generateWithReportTool] ${label} — recovery call did not produce ` +
+      `${reportTool.id}; using fallback.`,
+    );
+
+    if (process.env.DEBUG_MCP) {
+      console.warn(
+        `[generateWithReportTool] ${label} — recovery finishReason=${recoveryResult.finishReason}, ` +
+        `text=${recoveryResult.text?.slice(0, 500)}, ` +
+        `toolCalls=${JSON.stringify(recoveryResult.toolCalls)}`,
+      );
+    }
+  } catch (e) {
+    console.error(
+      `[generateWithReportTool] ${label} — recovery call failed; using fallback.`,
+      e,
+    );
+  }
+
+  return {
+    value: fallback,
+    finishReason: result.finishReason,
+  };
 }
 
 /**
@@ -1172,7 +1288,7 @@ async function runDeveloper(
       taskWithSandbox,
       reportTool,
       { summary: '', branch: '', diff: '', testResults: '', changedFiles: [] },
-      { maxSteps: 50 },
+      { maxSteps: 75 },
       'developer',
     );
 
@@ -1312,7 +1428,7 @@ const reviewSwarmWorkflow = new Workflow({
 })
   .parallel([securityReviewStep, performanceReviewStep, codeQualityReviewStep])
   .then(refuteStep)
-  .then(developStep)
+  //.then(developStep)
   .commit();
 
 const mastra = new Mastra({
@@ -1328,53 +1444,6 @@ const mastra = new Mastra({
 });
 
 
-/**
- * Rough token estimate — good enough for a truncation budget, not exact.
- * ~4 chars/token is a standard approximation for English/code text.
- */
-function estimateTokens(text: string): number {
-  return Math.ceil(text.length / 4);
-}
-
-/**
- * Cap the total size of phase-1 messages carried into the forced call.
- * Tool results (file reads, npm audit/eslint output) can be huge; without
- * a cap, threading the full trace risks exceeding the model's context
- * window entirely (seen in practice: a 1,048,576-token Gemini limit
- * exceeded from an uncapped forced-call prompt).
- *
- * Strategy: keep messages starting from the END (most recent tool calls
- * are usually most relevant to "what did you just find"), dropping older
- * ones once the budget is exhausted. Truncate any individual oversized
- * message's content rather than dropping it outright, so at least a
- * summary survives.
- */
-function capMessagesToBudget(messages: any[], maxTokens: number): any[] {
-  const kept: any[] = [];
-  let used = 0;
-
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const msg = messages[i];
-    const content = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content ?? '');
-    const tokens = estimateTokens(content);
-
-    if (used + tokens > maxTokens) {
-      const remaining = maxTokens - used;
-      if (remaining > 200) {
-        // Truncate this message to fit rather than dropping it entirely.
-        const truncatedChars = remaining * 4;
-        const truncatedContent = content.slice(0, truncatedChars) + '\n...[truncated]';
-        kept.unshift({ ...msg, content: truncatedContent });
-      }
-      break;
-    }
-
-    kept.unshift(msg);
-    used += tokens;
-  }
-
-  return kept;
-}
 
 // ── Event Handling ─────────────────────────────────────────────────────────────
 
