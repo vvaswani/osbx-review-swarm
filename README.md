@@ -159,6 +159,20 @@ bun run src/main.ts \
   --pr-number 123
 ```
 
+By default the swarm runs in **review-only mode** — it runs the three reviewers
+(security, performance, code quality), reconciles findings, and posts comments,
+but does **not** apply fixes.
+
+Pass `--fix` to also run the developer step, which implements fixes for accepted
+findings, commits them to a fix branch, and opens a sub-PR:
+
+```bash
+bun run src/main.ts \
+  --repository "owner/name" \
+  --pr-number 123 \
+  --fix
+```
+
 Use `--debug` to stream agent thinking as log lines:
 
 ```bash

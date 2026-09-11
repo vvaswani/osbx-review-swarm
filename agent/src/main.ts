@@ -2,10 +2,10 @@
 /**
  * Code review swarm CLI script.
  *
- * Run: bun run src/main.ts --repository owner/name --pr-number 123 [--debug]
+ * Run: bun run src/main.ts --repository owner/name --pr-number 123 [--debug] [--fix]
  *
  * Implements a Mastra workflow:
- *   3 parallel review steps → refute_findings → develop_fix
+ *   3 parallel review steps → refute_findings → [develop_fix]  (develop_fix only runs with --fix)
  *
  * Each reviewer/developer gets its own MCPClient + sandbox (created via the
  * OpenSandbox JS SDK, registered with the MCP server via sandbox_connect,
@@ -24,7 +24,7 @@
  * its final action; Mastra validates the tool call arguments the same way
  * it validates every other tool call. See createReportTool/generateWithReportTool.
  *
- * export OPENSANDBOX_INSECURE_SERVER=YES opensandbox-server
+ * OPENSANDBOX_INSECURE_SERVER=YES opensandbox-server
  * opensandbox-mcp --domain localhost:8080 --protocol http --transport streamable-http
  */
 
@@ -72,6 +72,13 @@ const MODEL = process.env.OPENROUTER_MODEL || 'openrouter/nvidia/nemotron-3.5-li
 const SANDBOX_IMAGE = process.env.SANDBOX_IMAGE || 'review-swarm-sandbox:latest';
 const SANDBOX_RESOURCE_LIMITS = { cpu: '1', memory: '2Gi' };
 const SANDBOX_TTL_SECONDS = 3600;
+// Cap on how many changed code files get listed in the task prompt sent to
+// the agents — keeps the prompt bounded on PRs that touch huge numbers of files.
+const MAX_REVIEWED_FILES = 20;
+// Cap on how many characters of a diff / test-results block get embedded in
+// a PR comment, so a huge diff or test log doesn't blow past GitHub's
+// comment size limit.
+const COMMENT_SNIPPET_LIMIT = 3000;
 const EXCLUDED_TOOLS = new Set([
   'sandbox_sandbox_create',
   'sandbox_sandbox_connect',
@@ -84,13 +91,13 @@ const EXCLUDED_TOOLS = new Set([
 ]);
 
 /**
- * Track sandboxes created during this run so cleanup only destroys
+ * Track Sandbox instances created during this run so cleanup only destroys
  * sandboxes we created — never pre-existing ones.
- * We store both the IDs (for filtering) and the Sandbox instances (for direct
- * kill() calls that bypass the unreliable SandboxManager.listSandboxInfos listing
- * step on SIGINT).
+ *
+ * We keep an array of Sandbox instances (not just IDs) so we can call
+ * sandbox.kill() directly, bypassing the unreliable SandboxManager.listSandboxInfos
+ * listing step on SIGINT.
  */
-const createdSandboxIds = new Set<string>();
 const createdSandboxes: Sandbox[] = [];
 
 /**
@@ -160,7 +167,7 @@ async function getPrContext(repository: string, prNumber: number): Promise<PrCon
     headRef: pr.head.ref,
     baseRef: pr.base.ref,
     diff: diff as unknown as string,
-    changedFiles: codeFiles.slice(0, 20),
+    changedFiles: codeFiles.slice(0, MAX_REVIEWED_FILES),
   };
 }
 
@@ -168,7 +175,7 @@ interface MinimizableComment {
   id: string;          // GraphQL node id
   databaseId: number;  // REST comment id, for logging
   isMinimized: boolean;
-  body: string;
+  body: string | null;
 }
 
 /**
@@ -293,14 +300,6 @@ async function minimizeOldComments(repository: string, prNumber: number): Promis
       continue;
     }
 
-    // Belt-and-suspenders: re-check isMinimized right before mutating, in
-    // case it changed between the fetch above and this point in the loop
-    // (e.g. another run minimized it concurrently).
-    if (comment.isMinimized) {
-      console.log(`Skipping comment databaseId=${comment.databaseId} — already minimized`);
-      continue;
-    }
-
     console.log(`Minimizing old comment databaseId=${comment.databaseId} id=${comment.id}`);
 
     const response = await fetch(GITHUB_GRAPHQL_URL, {
@@ -370,10 +369,6 @@ async function postPrComment(repository: string, prNumber: number, body: string)
 
 /**
  * Commit changes in the sandbox via git and push to a new fix branch.
- *
- * Uses git commands directly in the sandbox — the same approach as the Python
- * reference (osbx-self-healing-ci/agent/main.py:347-377) — rather than the
- * GitHub Contents API, which can't handle deletions, renames, or binary files.
  *
  * Returns the fix branch name, or an empty string if there was nothing to commit.
  */
@@ -727,7 +722,11 @@ async function generateWithReportTool<T>(
 }
 
 /**
- * Kill a single sandbox immediately and remove it from the tracking arrays.
+ * Kill a single sandbox immediately and remove it from the tracking array.
+ * Returns true if the kill call itself succeeded, false if it errored (the
+ * sandbox is still removed from tracking either way — killing an already-dead
+ * sandbox, or one we've lost track of, is treated as a no-op, not a retry
+ * target).
  *
  * Used to free resources early: reviewer sandboxes are killed right after
  * their agent finishes (they're no longer needed), and the developer sandbox
@@ -736,18 +735,22 @@ async function generateWithReportTool<T>(
  * sandboxes alive simultaneously causes CPU/network contention that can make
  * git operations hang and get killed by the timeout (exit code -1).
  *
- * The 10s timeout on kill() mirrors cleanupSandboxes — during shutdown the
- * OpenSandbox lifecycle API may be unreachable.
+ * The 10s timeout on kill() also protects cleanupSandboxes (which calls this
+ * for every remaining sandbox) during shutdown, when the OpenSandbox
+ * lifecycle API may be unreachable.
  *
- * Individual failures are logged as warnings — killing an already-dead
- * sandbox is a no-op.
+ * Individual failures are logged as warnings, never thrown — this is the
+ * single point of sandbox destruction and must never itself become the
+ * reason a run or a shutdown fails.
  */
-async function killSandbox(sandbox: Sandbox): Promise<void> {
+async function killSandbox(sandbox: Sandbox): Promise<boolean> {
   const id = sandbox.id;
   console.log(`[killSandbox] Killing sandbox ${id}`);
+  let success = false;
   try {
     await Promise.race([sandbox.kill(), timeout(10000)]);
     console.log(`[killSandbox] Deleted sandbox ${id}`);
+    success = true;
   } catch (e: any) {
     console.warn(`[killSandbox] Error killing sandbox ${id}:`, e);
   } finally {
@@ -756,26 +759,21 @@ async function killSandbox(sandbox: Sandbox): Promise<void> {
     } catch (e: any) {
       console.warn(`[killSandbox] Error closing transport for sandbox ${id}:`, e);
     }
-    createdSandboxIds.delete(id);
     const idx = createdSandboxes.findIndex((s) => s.id === id);
     if (idx !== -1) createdSandboxes.splice(idx, 1);
   }
+  return success;
 }
 
 /**
  * Idempotent, single-flight sandbox cleanup.
  *
- * Kills each Sandbox instance created during this run by calling
- * sandbox.kill() directly. This is the single point of sandbox destruction —
- * agents no longer call sandbox_kill themselves; each step's sandbox is
- * created by runReviewer/runDeveloper and killed here as a safety-net.
+ * Kills every Sandbox instance still tracked from this run via killSandbox —
+ * this is the safety-net that runs at the end of main() (and on SIGINT/SIGTERM)
+ * for any sandbox that wasn't already killed early by runReviewer/runDeveloper.
  *
- * We call sandbox.kill() directly on each instance rather than using
- * SandboxManager.listSandboxInfos (which can fail on SIGINT when the listing
- * step returns incomplete results). The stored Sandbox instances carry their
- * own connection state, so direct kill() is reliable even during shutdown.
- *
- * Individual kill failures are logged as warnings — cleanup never throws.
+ * Kills run in parallel since they're independent, so shutdown isn't gated
+ * on the slowest sandbox.
  *
  * Concurrent calls share the same Promise so cleanup runs at most once.
  */
@@ -794,27 +792,8 @@ async function cleanupSandboxes(): Promise<void> {
     }
 
     console.log(`Found ${toKill.length} sandbox(es) to clean up`);
-
-    let cleaned = 0;
-    for (const sandbox of toKill) {
-      const id = sandbox.id;
-      console.log(`Deleting sandbox ${id}`);
-      try {
-        await Promise.race([sandbox.kill(), timeout(10000)]);
-        console.log(`Deleted sandbox ${id}`);
-        cleaned++;
-      } catch (e: any) {
-        console.warn(`Error deleting sandbox ${id}:`, e);
-      } finally {
-        try {
-          await sandbox.close();
-        } catch (e: any) {
-          console.warn(`Error closing transport for sandbox ${id}:`, e);
-        }
-        createdSandboxIds.delete(id);
-      }
-    }
-
+    const results = await Promise.all(toKill.map((sandbox) => killSandbox(sandbox)));
+    const cleaned = results.filter(Boolean).length;
     console.log(`Sandbox cleanup complete (${cleaned}/${toKill.length} deleted)`);
   })();
 
@@ -843,7 +822,6 @@ async function createSandbox(): Promise<Sandbox> {
         'postgresql://postgres:postgres@localhost:5432/postgres',
     },
   });
-  createdSandboxIds.add(sandbox.id);
   createdSandboxes.push(sandbox);
   console.log(`[createSandbox] Sandbox ${sandbox.id} is ready (Running + healthy)`);
   return sandbox;
@@ -1008,16 +986,8 @@ async function connectSandboxToMcp(tools: ToolsInput, sandboxId: string): Promis
 type Finding = z.infer<typeof FindingSchema>;
 type ReviewerOutput = z.infer<typeof ReviewerStructuredOutputSchema>;
 type RefuteOutput = z.infer<typeof RefuteOutputSchema>;
-
-/** Developer output — extends the schema with subPrUrl (set after git push). */
-interface DeveloperOutput {
-  diff: string;
-  summary: string;
-  branch: string;
-  changedFiles: string[];
-  subPrUrl: string;
-  testResults: string;
-}
+/** Developer output — extends the reported schema with subPrUrl (set after git push). */
+type DeveloperOutput = z.infer<typeof DeveloperStructuredOutputSchema> & { subPrUrl: string };
 
 function formatFinding(f: Finding): string {
   return `**${f.title}** — *${f.location}* — ${f.description}\n\nSuggestion: ${f.suggestion}`;
@@ -1045,13 +1015,13 @@ function formatReviewerComment(findings: ReviewerOutput, title: string): string 
 
 function formatRefutedComment(refuteResult: RefuteOutput): string {
   const acceptedLines = refuteResult.accepted
-    .map((f) => `**${f.severity}** — ${f.title} — ${f.location}`)
-    .join('\n');
+    .map((f) => `${formatFinding(f)}\n\n_Accepted: ${f.reason}_`)
+    .join('\n\n') || '_None_';
   const rejectedLines = refuteResult.rejected
-    .map((f) => `**${f.severity}** — ${f.title} — ${f.location} — _rejected: ${f.reason}_`)
-    .join('\n');
+    .map((f) => `${formatFinding(f)}\n\n_Rejected: ${f.reason}_`)
+    .join('\n\n') || '_None_';
 
-  return `# Findings Summary\n\n## Accepted (${refuteResult.accepted.length})\n${acceptedLines || '_None_'}\n\n## Rejected (${refuteResult.rejected.length})\n${rejectedLines || '_None_'}`;
+  return `# Review Analysis\n\n## Accepted (${refuteResult.accepted.length})\n${acceptedLines}\n\n## Rejected (${refuteResult.rejected.length})\n${rejectedLines}`;
 }
 
 function formatChangesetComment(
@@ -1062,9 +1032,9 @@ function formatChangesetComment(
   testResults: string,
 ): string {
   const testSection = testResults
-    ? `\n\n## Test Results\n\`\`\`\n${testResults.slice(0, 3000)}\n\`\`\``
+    ? `\n\n## Test Results\n\`\`\`\n${testResults.slice(0, COMMENT_SNIPPET_LIMIT)}\n\`\`\``
     : '';
-  return `# Fix Applied\n\n**Branch:** \`${branch}\`\n\n**Summary:** ${summary}\n\n## Diff\n\`\`\`diff\n${diff.slice(0, 3000)}\n\`\`\`\n\n## Sub-PR\n${subPrUrl}${testSection}`;
+  return `# Fix Applied\n\n**Branch:** \`${branch}\`\n\n**Summary:** ${summary}\n\n## Diff\n\`\`\`diff\n${diff.slice(0, COMMENT_SNIPPET_LIMIT)}\n\`\`\`\n\n## Sub-PR\n${subPrUrl}${testSection}`;
 }
 
 function formatFindingsForRefuter(
@@ -1128,12 +1098,12 @@ const ReviewerStructuredOutputSchema = z.object({
   findings: z.array(FindingSchema),
 });
 
-/** Refuter output — reported via the report_evaluation tool. */
+/** A finding the refuter has classified, with its rationale either way. */
+const EvaluatedFindingSchema = FindingSchema.extend({ reason: z.string() });
+
 const RefuteOutputSchema = z.object({
-  accepted: z.array(FindingSchema),
-  rejected: z.array(
-    FindingSchema.extend({ reason: z.string() }),
-  ),
+  accepted: z.array(EvaluatedFindingSchema),
+  rejected: z.array(EvaluatedFindingSchema),
 });
 
 /** Developer structured output — reported via the report_fix tool. */
@@ -1252,8 +1222,9 @@ async function runReviewer(
  *
  * The agent reports its work by calling the local report_fix tool as its
  * final action. The developer sandbox is killed immediately after
- * commit+push (it's no longer needed); cleanupSandboxes() remains as a
- * safety-net for any sandboxes still alive if the step throws.
+ * commit+push (it's no longer needed); if anything throws before that point
+ * (e.g. gitCommitAndPush fails), the `finally` block below kills it instead,
+ * so it never has to wait for the end-of-run cleanupSandboxes() safety-net.
  */
 async function runDeveloper(
   instructions: string,
@@ -1264,6 +1235,7 @@ async function runDeveloper(
 ): Promise<DeveloperOutput> {
   const mcp = createMcpClient();
   const sandbox = await createSandbox();
+  let sandboxKilled = false;
   const taskWithSandbox = `${task}\n\nSANDBOX_ID: ${sandbox.id}`;
   try {
     const tools = await mcp.listTools();
@@ -1322,6 +1294,7 @@ async function runDeveloper(
     // Developer sandbox is no longer needed after commit+push — kill it
     // immediately to free resources (same reasoning as reviewer sandboxes).
     await killSandbox(sandbox);
+    sandboxKilled = true;
 
     if (pushedBranch) {
       output.subPrUrl = await createFixBranchAndPr(repository, headRef, pushedBranch, output.summary);
@@ -1330,6 +1303,12 @@ async function runDeveloper(
     return output;
   } finally {
     await mcp.disconnect();
+    // Safety-net: if we threw (or returned) before the post-commit kill
+    // above ran, make sure the sandbox still gets cleaned up immediately
+    // rather than sitting alive until the end-of-run cleanupSandboxes().
+    if (!sandboxKilled) {
+      await killSandbox(sandbox);
+    }
   }
 }
 
@@ -1421,15 +1400,23 @@ const developStep = createStep({
 
 // ── Workflow Definition ────────────────────────────────────────────────────────
 
-const reviewSwarmWorkflow = new Workflow({
+// Whether the develop_fix step should be part of the workflow graph at all.
+// Read directly from argv here (rather than via parseArgs/main) so importing
+// this module has no other side effects — full CLI validation still happens
+// in main() below.
+const FIX_FLAG_ENABLED = process.argv.includes('--fix');
+
+const workflowBuilder = new Workflow({
   id: 'CodeReviewSwarm',
   inputSchema: InputSchema,
   outputSchema: OutputSchema,
 })
   .parallel([securityReviewStep, performanceReviewStep, codeQualityReviewStep])
-  .then(refuteStep)
-  //.then(developStep)
-  .commit();
+  .then(refuteStep);
+
+const reviewSwarmWorkflow = FIX_FLAG_ENABLED
+  ? workflowBuilder.then(developStep).commit()
+  : workflowBuilder.commit();
 
 const mastra = new Mastra({
   workflows: { CodeReviewSwarm: reviewSwarmWorkflow },
@@ -1504,6 +1491,9 @@ async function handleStepCompletion(
 
   if (debug) {
     console.log(`Step finished: ${stepId}`);
+    if (ctx) {
+      console.log(`  Changed files (${ctx.changedFiles.length}): ${ctx.changedFiles.join(', ')}`);
+    }
   }
 
   if (!stepId) {
@@ -1512,7 +1502,7 @@ async function handleStepCompletion(
   }
 
   if (stepId === 'develop_fix') {
-    const dev = event.payload?.output?.result as DeveloperOutput | undefined;
+    const dev = extractStepResult<DeveloperOutput>(event);
 
     // Treat a missing/placeholder diff or branch as "no real fix produced" —
     // even if summary is non-empty prose (e.g. the agent reporting it was
@@ -1582,10 +1572,11 @@ interface CliArgs {
   repository: string;
   prNumber: number;
   debug: boolean;
+  fix: boolean;
 }
 
 function parseArgs(argv: string[]): CliArgs {
-  const args: CliArgs = { repository: '', prNumber: NaN, debug: false };
+  const args: CliArgs = { repository: '', prNumber: NaN, debug: false, fix: false };
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -1597,6 +1588,8 @@ function parseArgs(argv: string[]): CliArgs {
       i++;
     } else if (arg === '--debug') {
       args.debug = true;
+    } else if (arg === '--fix') {
+      args.fix = true;
     }
   }
 
@@ -1625,6 +1618,11 @@ async function main() {
 
   console.log(`Starting code review swarm for ${args.repository} PR #${args.prNumber}`);
   if (args.debug) console.log(`Debug mode enabled. Model: ${MODEL}`);
+  if (args.fix) {
+    console.log('Fix mode enabled. Developer step will run after review.');
+  } else {
+    console.log('Review-only mode. Pass --fix to apply fixes after review.');
+  }
 
   // 1. Fetch PR context (diff, changed files, metadata) — validates the PR exists
   const ctx = await getPrContext(args.repository, args.prNumber);
@@ -1692,21 +1690,21 @@ ${changedFilesStr}
 // ── Graceful Shutdown ────────────────────────────────────────────────────────────
 
 process.once('SIGINT', () => {
-  console.log('\nSIGINT — aborting workflow and cleaning up sandboxes...');
+  console.log('\nSIGINT, aborting workflow and cleaning up sandboxes...');
   signalExitCode = 130;
   currentRunAbortController?.abort();
   cleanupSandboxes()
     .catch((e) => console.warn('Cleanup failed during shutdown:', e))
-    .finally(() => process.exit(signalExitCode ?? 130));
+    .finally(() => process.exit(130));
 });
 
 process.once('SIGTERM', () => {
-  console.log('SIGTERM — aborting workflow and cleaning up sandboxes...');
+  console.log('SIGTERM, aborting workflow and cleaning up sandboxes...');
   signalExitCode = 143;
   currentRunAbortController?.abort();
   cleanupSandboxes()
     .catch((e) => console.warn('Cleanup failed during shutdown:', e))
-    .finally(() => process.exit(signalExitCode ?? 143));
+    .finally(() => process.exit(143));
 });
 
 main().catch(async (err) => {
