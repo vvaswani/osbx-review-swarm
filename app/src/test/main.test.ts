@@ -15,7 +15,7 @@ async function clearBooks() {
   await db.delete(books);
 }
 
-async function createBookViaApi(app: FastifyInstance, book: { title: string; author: string }) {
+async function createBookViaApi(app: FastifyInstance, book: { title: string; author: string; publisher: string }) {
   return app.inject({
     method: 'POST',
     url: '/books',
@@ -24,9 +24,9 @@ async function createBookViaApi(app: FastifyInstance, book: { title: string; aut
 }
 
 const TEST_BOOKS = [
-  { title: 'Carrie', author: 'Stephen King' },
-  { title: 'Ready Player One', author: 'Ernest Cline' },
-  { title: 'The Shining', author: 'Stephen King' },
+  { title: 'Carrie', author: 'Stephen King', publisher: 'TestPublisher' },
+  { title: 'Ready Player One', author: 'Ernest Cline', publisher: 'TestPublisher' },
+  { title: 'The Shining', author: 'Stephen King', publisher: 'TestPublisher' },
 ];
 
 describe('App', () => {
@@ -68,6 +68,7 @@ describe('App', () => {
       expect(book.author).toBe(TEST_BOOKS[0].author);
       expect(book.id).toBeDefined();
       expect(book.id).toBeGreaterThan(0);
+      expect(book.publisher).toBe(TEST_BOOKS[0].publisher);
     });
 
     it('should allow two books with the same author', async () => {
@@ -95,9 +96,11 @@ describe('App', () => {
       expect(allBooks[0].title).toBe(TEST_BOOKS[0].title);
       expect(allBooks[0].author).toBe(TEST_BOOKS[0].author);
       expect(allBooks[0].id).toBeDefined();
+      expect(allBooks[0].publisher).toBe(TEST_BOOKS[0].publisher);
       expect(allBooks[1].title).toBe(TEST_BOOKS[1].title);
       expect(allBooks[1].author).toBe(TEST_BOOKS[1].author);
       expect(allBooks[1].id).toBeDefined();
+      expect(allBooks[1].publisher).toBe(TEST_BOOKS[1].publisher);
     });
 
     it('should get all books with limit and skip', async () => {
@@ -132,6 +135,7 @@ describe('App', () => {
       expect(book.id).toBe(created.id);
       expect(book.title).toBe(TEST_BOOKS[0].title);
       expect(book.author).toBe(TEST_BOOKS[0].author);
+      expect(book.publisher).toBe(TEST_BOOKS[0].publisher);
     });
 
     it('should return 400 for non-numeric book ID on GET', async () => {
@@ -153,6 +157,7 @@ describe('App', () => {
       expect(updated.title).toBe(TEST_BOOKS[1].title);
       expect(updated.author).toBe(TEST_BOOKS[1].author);
       expect(updated.id).toBe(created.id);
+      expect(updated.publisher).toBe(TEST_BOOKS[1].publisher);
     });
 
     it('should delete a book', async () => {
