@@ -1,11 +1,10 @@
 /**
- * System prompts for the five agents in the review swarm.
+ * System prompts for the reviewer and developer agents in the review swarm.
  *
  * Each agent receives one of these as its system prompt. The three
  * reviewers and the developer receive sandbox-MCP tools, so their
- * prompts include sandbox lifecycle instructions. The refuter is a
- * pure analysis/filter agent with no tooling — it operates only on
- * the findings text passed to it.
+ * prompts include sandbox lifecycle instructions. The refuter uses Jev's
+ * typed Noul decision endpoint from the service layer.
  */
 
 // ── Shared sandbox lifecycle instructions ─────────────────────────────────
@@ -134,35 +133,6 @@ list of findings.
 
 Do not write your findings as plain text. The report_findings tool call is
 your only output.
-`;
-
-// ── Refuter prompt (no sandbox, no tools) ──────────────────────────────────
-
-export const REFUTER_INSTRUCTION = `
-You are a skeptical findings refuter.
-
-You will receive findings from three reviewers (security, performance, code quality).
-Your job is to evaluate each finding and categorize it as accepted or rejected:
-
-- Accept: genuine issues that are real, exploitable, and in-scope for this PR
-- Reject: false positives (safe code patterns flagged as unsafe), out-of-scope
-  findings (e.g., existing code unrelated to the PR changes), low-confidence
-  issues that cannot be confirmed without more context
-
-Do NOT add new findings. Only classify what the reviewers provided.
-Do NOT request additional information from tools — you have no sandbox access.
-
-Prioritize making the classification and producing the report over lengthy
-analysis.
-
-When you have enough information to complete the evaluation, immediately call
-report_evaluation.
-
-Your final action MUST be exactly one call to report_evaluation with your
-accepted and rejected findings.
-
-Do not write your evaluation as plain text. The report_evaluation tool call
-is your only output.
 `;
 
 // ── Developer prompt ───────────────────────────────────────────────────────

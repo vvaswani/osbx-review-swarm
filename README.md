@@ -45,8 +45,8 @@ A code review swarm built with [Mastra](https://mastra.ai), [Bun 1.4](https://bu
 │  └─────────────────────────────────────────┘                │
 │                                                             │
 │  Each reviewer/developer creates its own MCPClient →        │
-│  sandbox (ephemeral Docker container). Refuter has no       │
-│  sandbox (pure analysis of findings text).                  │
+│  sandbox (ephemeral Docker container). Refuter calls        │
+│  Jev's typed validity decision through OpenRouter.           │
 │                                                             │
 │  GitHub operations (minimize old comments, post PR         │
 │  comments, create fix branch + sub-PR) are in the service   │
@@ -189,7 +189,7 @@ bun run src/main.ts \
 | `GH_TOKEN` | yes | GitHub token (`repo` scope) for PR comments, fix branches |
 | `OPENROUTER_API_KEY` | yes | OpenRouter API key for LLM access |
 | `OPENROUTER_REVIEWER_MODEL` | yes | OpenRouter model reference used by the three review agents. |
-| `OPENROUTER_REFUTER_MODEL` | yes | OpenRouter model reference used to reconcile review findings. |
+| `OPENROUTER_REFUTER_MODEL` | yes | Jev decision model via OpenRouter Decisions API (for example, `typesafe/jev-1.13`). |
 | `OPENROUTER_DEVELOPER_MODEL` | yes | OpenRouter model reference used by the fix agent. |
 | `OPENSANDBOX_MCP_URL` | no | MCP server URL (default: `http://localhost:8000/mcp`) |
 
@@ -245,7 +245,7 @@ The workflow in `.github/workflows/review-swarm.yml` triggers on PRs that modify
 │  2. Fetch PR context (Octokit REST API)             │
 │  3. .parallel() — 3 reviewers (concurrent:         │
 │     each creates own sandbox, runs linters/tests)   │
-│  4. .then() — refute findings (no sandbox)         │
+│  4. .then() — score findings with Jev (no sandbox) │
 │  5. .then() — develop fix (own sandbox, git diff)  │
 │                                                     │
 │  As each step completes (streamed events),          │
@@ -271,7 +271,7 @@ Before CI can run correctly, configure these in your GitHub repository:
 | Name | Default | Description |
 |------|---------|-------------|
 | `OPENROUTER_REVIEWER_MODEL` | Required | OpenRouter model reference for all three review agents. |
-| `OPENROUTER_REFUTER_MODEL` | Required | OpenRouter model reference for review finding reconciliation. |
+| `OPENROUTER_REFUTER_MODEL` | Required | Jev decision model for typed validity probabilities, such as `typesafe/jev-1.13`. |
 | `OPENROUTER_DEVELOPER_MODEL` | Required | OpenRouter model reference for fix development. |
 | `OPENSANDBOX_DOMAIN` | `localhost:8080` | Sandbox server address. |
 | `OPENSANDBOX_MCP_URL` | `http://localhost:8000/mcp` | MCP server URL. |
@@ -308,7 +308,7 @@ The agent's `OPENSANDBOX_IMAGE` env var (default: `review-swarm-sandbox:latest`)
    c. Builds a task string with PR metadata
 4. **Mastra workflow starts**:
    a. **3 parallel review steps** — each creates its own `MCPClient + Agent`, creates a sandbox, clones the repo, runs linters (`tsc --no-errors`, `eslint`, `prettier --check` for TS), analyzes code, returns **markdown** findings (no Zod schemas — plain text), then destroys its sandbox
-   b. When ALL 3 reviews complete, **refute step** fires — creates an agent (no MCPClient, no sandbox), analyzes findings, returns a markdown summary of accepted/rejected findings
+   b. When ALL 3 reviews complete, **refute step** sends each finding, PR context, and the PR diff to Jev through OpenRouter's Decisions API, then accepts findings with validity probability ≥75%
    c. After refutation, **develop step** fires — creates its own `MCPClient + Agent`, creates a sandbox, implements fixes, generates a git diff, returns markdown with `## Summary`, `## Branch`, and `## Diff` sections
 5. **Event streaming**: As each step completes, the workflow streams `step-finished` events — the CLI script posts a PR comment via Octokit (🔒 Security, ⚡ Performance, 🧹 Quality, 🎯 Findings Summary, 💻 Fix Applied)
 6. **Developer step completion**: CLI script parses the developer's markdown output, creates a fix branch from the PR head, commits the diff via GitHub Contents API, and opens a sub-PR
@@ -329,16 +329,16 @@ Agents return **plain markdown** — no Zod schemas for structured output. Each 
 1. **Connection pool not configured** — `src/db.ts:1` — Description...
 ```
 
-The refuter returns:
+The refuter posts a Review Analysis comment with each finding's Jev validity probability and accepted/rejected status:
 
 ```markdown
 ## Accepted
 
-1. HIGH — SQL Injection Risk — Reasoning...
+1. HIGH — SQL Injection Risk — 92% validity probability — Reasoning...
 
 ## Rejected
 
-1. MEDIUM — Unused variable — Out of scope for this PR...
+1. MEDIUM — Unused variable — 24% validity probability — Out of scope for this PR...
 ```
 
 The developer returns:
