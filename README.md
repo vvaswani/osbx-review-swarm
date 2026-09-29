@@ -188,7 +188,9 @@ bun run src/main.ts \
 |------|----------|-------------|
 | `GH_TOKEN` | yes | GitHub token (`repo` scope) for PR comments, fix branches |
 | `OPENROUTER_API_KEY` | yes | OpenRouter API key for LLM access |
-| `OPENROUTER_MODEL` | no | Model path, e.g. `deepseek/deepseek-chat-v3.1:free` (default: `deepseek/deepseek-chat`) |
+| `OPENROUTER_REVIEWER_MODEL` | yes | OpenRouter model reference used by the three review agents. |
+| `OPENROUTER_REFUTER_MODEL` | yes | OpenRouter model reference used to reconcile review findings. |
+| `OPENROUTER_DEVELOPER_MODEL` | yes | OpenRouter model reference used by the fix agent. |
 | `OPENSANDBOX_MCP_URL` | no | MCP server URL (default: `http://localhost:8000/mcp`) |
 
 ### 6. Run the books app locally
@@ -268,7 +270,9 @@ Before CI can run correctly, configure these in your GitHub repository:
 
 | Name | Default | Description |
 |------|---------|-------------|
-| `OPENROUTER_MODEL` | `deepseek/deepseek-chat` | OpenRouter model path (without `openrouter/` prefix). |
+| `OPENROUTER_REVIEWER_MODEL` | Required | OpenRouter model reference for all three review agents. |
+| `OPENROUTER_REFUTER_MODEL` | Required | OpenRouter model reference for review finding reconciliation. |
+| `OPENROUTER_DEVELOPER_MODEL` | Required | OpenRouter model reference for fix development. |
 | `OPENSANDBOX_DOMAIN` | `localhost:8080` | Sandbox server address. |
 | `OPENSANDBOX_MCP_URL` | `http://localhost:8000/mcp` | MCP server URL. |
 

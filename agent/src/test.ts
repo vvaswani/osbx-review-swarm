@@ -8,7 +8,10 @@ import { z } from 'zod';
 import { config } from 'dotenv';
 config();
 
-const MODEL = process.env.OPENROUTER_MODEL || 'openrouter/nvidia/nemotron-3.5-lightning:free';
+const MODEL = process.env.OPENROUTER_REVIEWER_MODEL;
+if (!MODEL?.trim()) {
+  throw new Error('Missing required OpenRouter model setting: OPENROUTER_REVIEWER_MODEL');
+}
 
 // ── Copied unchanged from main.ts ──────────────────────────────────────────
 
