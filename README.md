@@ -1,119 +1,61 @@
 # Code Review Swarm
 
-A code review swarm built with [Mastra](https://mastra.ai), [Bun 1.4](https://bun.sh), [Fastify](https://fastify.dev), and [OpenSandbox](https://github.com/ryanrjohnston/opensandbox). When triggered on a pull request, it spins up ephemeral sandboxes, runs 3 concurrent AI reviewers (security, performance, code quality), reconciles findings, and files a fix PR — all automated.
+A code review swarm built with [Mastra](https://mastra.ai), [Bun](https://bun.sh), [OpenSandbox](https://github.com/ryanrjohnston/opensandbox), and OpenRouter. For a pull request, three specialized reviewers inspect the proposed changes in parallel. A validity step scores each finding, then an optional developer agent can implement accepted findings and open a fix pull request.
 
 ## Example
 
-- Deliberately broken PR: https://github.com/vvaswani/osbx-self-healing-ci/pull/6
-- Agent diagnosis: https://github.com/vvaswani/osbx-self-healing-ci/pull/6#issuecomment-5431021036
-- Agent fix: https://github.com/vvaswani/osbx-self-healing-ci/pull/7
+- PR: https://github.com/vvaswani/osbx-review-swarm/pull/1
+- Reviews:
+  - Security: https://github.com/vvaswani/osbx-review-swarm/pull/1#issuecomment-5896593316
+  - Code quality: https://github.com/vvaswani/osbx-review-swarm/pull/1#issuecomment-5896602909
+  - Performance: https://github.com/vvaswani/osbx-review-swarm/pull/1#issuecomment-5896601972
+- Review analysis: https://github.com/vvaswani/osbx-review-swarm/pull/1#issuecomment-5896605049
 
-## Architecture
+## How the swarm works
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                     GitHub PR                                │
-│         (opened or synchronize)                              │
-└───────────────────────┬─────────────────────────────────────┘
-                          │
-                          ▼
-┌─────────────────────────────────────────────────────────────┐
-│  GitHub Actions (review-swarm.yml)                          │
-│  1. Checkout repo                                           │
-│  2. Setup Bun 1.4                                           │
-│  3. Install OpenSandbox (pip — Python infrastructure only)   │
-│  4. Start OpenSandbox server + MCP server                   │
-│  5. bun install (agent deps)                                │
-│  6. bun run src/main.ts --repository ... --pr-number ...    │
-└───────────────────────┬─────────────────────────────────────┘
-                          │
-                          ▼
-┌─────────────────────────────────────────────────────────────┐
-│  Agent (agent/src/main.ts — CLI script)                     │
-│  ┌─────────────────────────────────────────┐                │
-│  │ Mastra Workflow                         │                │
-│  │  .parallel([                             │                │
-│  │    ┌─ security_review ─┐               │                │
-│  │    ├─ performance_    │                │                │
-│  │    │  review          │                │                │
-│  │    └─ code_quality_   │                │                │
-│  │       │  review       │                │                │
-│  │  ])                                   │                │
-│  │       │ (AND: all 3 must finish)        │                │
-│  │  .then(refute_findings)                 │                │
-│  │  .then(develop_fix)                    │                │
-│  └─────────────────────────────────────────┘                │
-│                                                             │
-│  Each reviewer/developer creates its own MCPClient →        │
-│  sandbox (ephemeral Docker container). Refuter calls        │
-│  Jev's typed validity decision through OpenRouter.           │
-│                                                             │
-│  GitHub operations (minimize old comments, post PR         │
-│  comments, create fix branch + sub-PR) are in the service   │
-│  layer — NOT inside the agents.                             │
-└─────────────────────────────────────────────────────────────┘
-                          │
-                          ▼
-┌─────────────────────────────────────────────────────────────┐
-│  Sandbox (Docker container, image: review-swarm-sandbox)     │
-│  ┌─────────────────────────────────────────┐                │
-│  │ oven/bun:1.4-alpine base                │                │
-│  │  - git, PostgreSQL (via entrypoint.sh)  │                │
-│  │  - TS linters: eslint, prettier, tsc   │                │
-│  │  - Polyglot linters: ruff, bandit, go  │                │
-│  └─────────────────────────────────────────┘                │
-└─────────────────────────────────────────────────────────────┘
+```text
+CLI input: repository + PR number
+                 │
+                 ├── Fetch PR metadata, diff, and changed code files
+                 ├── Minimize older swarm comments (review/full runs)
+                 │
+                 ├── Security reviewer ───┐
+                 ├── Performance reviewer ├── run concurrently
+                 └── Code quality reviewer┘
+                           │
+                 Each reports typed findings
+                 through a schema-validated tool
+                           │
+                 Jev scores each finding's validity
+                 using OpenRouter Decisions API
+                 Accept if probability is at least 75%
+                           │
+                 ┌─────────┴─────────┐
+                 │                   │
+             --review             full run
+             stop here          developer fixes accepted
+                                     │
+                           commit + push fix branch
+                           and open a sub-PR to PR head
 ```
 
-## Monorepo structure
+Each reviewer gets its own temporary OpenSandbox container and MCP connection. The container clones the repository, checks out the pull request's head branch, installs the app dependencies, and gives the reviewer tools to inspect and run commands against that checkout. Reviewers use different instructions for security, performance, and code quality, but share the configured reviewer model.
 
-```
-osbx-review-swarm/
-├── app/                         # Books CRUD app (the "code under test")
-│   ├── Dockerfile               # Container image (oven/bun:1.4-alpine)
-│   ├── docker-compose.yml       # Local dev: app + PostgreSQL
-│   ├── .env                     # App env (DB credentials)
-│   ├── .gitignore
-│   ├── package.json             # Bun dependencies
-│   ├── tsconfig.json            # TypeScript config
-│   ├── db.sql                   # Schema initialization
-│   └── src/
-│       ├── main.ts              # Fastify app factory
-│       ├── routers.ts           # API routes (CRUD)
-│       ├── models.ts            # Zod schemas + Drizzle table
-│       ├── db.ts                # Drizzle database connection
-│       ├── repositories.ts      # Data access layer
-│       └── test/
-│           └── main.test.ts     # Bun test runner tests
-│
-├── agent/                       # Code review swarm agent (CLI script)
-│   ├── .env                     # ⚠️ Contains live secrets — rotate!
-│   ├── .env.example             # Template for .env
-│   ├── package.json             # Bun dependencies (Mastra, Octokit, Zod)
-│   ├── tsconfig.json            # TypeScript config
-│   └── src/
-│       ├── main.ts              # Workflow + GitHub helpers + CLI entry (single file)
-│       └── prompts.ts           # System prompts for 5 agents
-│
-├── sandbox/                     # Docker image for agent's execution sandbox
-│   ├── Dockerfile               # oven/bun:1.4-alpine + linters + PostgreSQL
-│   └── entrypoint.sh            # Starts PostgreSQL on container start
-│
-├── .github/
-│   └── workflows/
-│       └── review-swarm.yml     # Trigger agent on PR events
-├── .gitignore
-└── README.md
-```
+The refuter does not use a sandbox or generate free-form scores. It sends each finding, the PR context, and the relevant diff hunk to the configured Jev Decisions model. A finding is accepted at a validity probability of `0.75` or higher.
 
-## Prerequisites
+When fixes are enabled, the developer gets a separate sandbox and works from the PR head branch. The agent reports a summary, proposed diff, branch, test results, and changed files through a schema-validated `report_fix` tool. The service commits and pushes the sandbox checkout to a fix branch and opens a sub-PR against the original PR's head branch. A fix comment is posted only after a commit was pushed and GitHub returned a sub-PR URL.
 
-- Docker (with buildx for multi-platform)
-- Bun 1.4+ ([install guide](https://bun.sh/docs/install/bun))
-- OpenRouter API key ([openrouter.ai/keys](https://openrouter.ai/keys))
-- GitHub token with `repo` scope (read + push to fix branches)
+GitHub API operations are handled by the CLI service layer: retrieving PR data, minimizing marked comments, posting review comments, pushing the fix branch, and creating the sub-PR. Agent tools operate on their sandbox checkout.
 
-## Local setup
+## Run the agent
+
+### Prerequisites
+
+- Bun 1.4 or newer
+- Docker, for building the sandbox image
+- An OpenSandbox server and MCP server
+- An OpenRouter API key and model references
+- A GitHub token that can read the repository, post issue comments, push branches, and create pull requests
 
 ### 1. Build the sandbox image
 
@@ -121,258 +63,130 @@ osbx-review-swarm/
 docker build -t review-swarm-sandbox:latest -f sandbox/Dockerfile sandbox/
 ```
 
-### 2. Start the OpenSandbox server
+The image is based on `oven/bun:1.4-alpine` and includes Git, Bun/Node tooling, PostgreSQL, Go, Java, and Python tools such as Ruff, Flake8, and Bandit. The agent starts `/entrypoint.sh` in each sandbox to initialize PostgreSQL for repositories that need a database during checks.
 
-The agent needs an OpenSandbox server running on `localhost:8080`. Use `OPENSANDBOX_INSECURE_SERVER=YES` to skip API key authentication (recommended for local development):
+### 2. Start OpenSandbox and its MCP server
+
+Install the Python infrastructure packages and start the API server:
 
 ```bash
-pip install opensandbox opensandbox-mcp
-OPENSANDBOX_INSECURE_SERVER=YES opensandbox-server
+pip install opensandbox opensandbox-server opensandbox-mcp
+OPENSANDBOX_INSECURE_SERVER=YES opensandbox-server --port 8080
 ```
 
-> **Note:** OpenSandbox is Python-only infrastructure for sandbox container management. This is the only Python dependency — all agent code, app code, and the sandbox image are TypeScript/Bun.
-
-### 3. Start the OpenSandbox MCP server
-
-The OpenSandbox MCP server bridges the agent's tools (file read/write, command execution) to the OpenSandbox server:
+In another terminal, start the MCP bridge:
 
 ```bash
 OPENSANDBOX_INSECURE_SERVER=YES opensandbox-mcp \
   --domain localhost:8080 --protocol http --transport streamable-http
 ```
 
-### 4. Install agent dependencies
+The agent uses the OpenSandbox API at `http://localhost:8080` and MCP at `http://localhost:8000/mcp` by default. These can be changed with `OPENSANDBOX_API_URL` and `OPENSANDBOX_MCP_URL`.
+
+### 3. Configure the agent
 
 ```bash
 cd agent
-cp .env.example .env        # edit with your real API keys
+cp .env.example .env
 bun install --frozen-lockfile
 ```
 
-### 5. Run the code review swarm
+Set these values in `agent/.env` or the process environment:
 
-The agent is a **CLI script** (not an HTTP service). Run it directly:
+| Variable | Required | Purpose |
+|---|---:|---|
+| `GITHUB_TOKEN` or `GH_TOKEN` | Yes | GitHub API access and authenticated push for the fix branch |
+| `OPENROUTER_API_KEY` | Yes | OpenRouter access for review, validity scoring, and development |
+| `OPENROUTER_REVIEWER_MODEL` | Yes | Model used by the three reviewers |
+| `OPENROUTER_REFUTER_MODEL` | Yes | Jev Decisions model for typed validity probabilities, e.g. `typesafe/jev-1.13` |
+| `OPENROUTER_DEVELOPER_MODEL` | Yes | Model used by the fix agent |
+| `OPENSANDBOX_MCP_URL` | No | MCP endpoint; default `http://localhost:8000/mcp` |
+| `OPENSANDBOX_API_URL` | No | OpenSandbox API endpoint; default `http://localhost:8080` |
+| `OPENSANDBOX_API_KEY` or `OPEN_SANDBOX_API_KEY` | No | API key if the OpenSandbox server requires one |
+| `SANDBOX_IMAGE` | No | Sandbox image; default `review-swarm-sandbox:latest` |
+| `DATABASE_URL` | No | Database URL passed into the sandbox; default is local PostgreSQL credentials |
 
-```bash
-bun run src/main.ts \
-  --repository "owner/name" \
-  --pr-number 123
-```
+The model variables must be set. The refuter must use a Jev Decisions model, not `typesafe/jev-router`.
 
-By default the swarm runs in **review-only mode** — it runs the three reviewers
-(security, performance, code quality), reconciles findings, and posts comments,
-but does **not** apply fixes.
-
-Pass `--fix` to also run the developer step, which implements fixes for accepted
-findings, commits them to a fix branch, and opens a sub-PR:
-
-```bash
-bun run src/main.ts \
-  --repository "owner/name" \
-  --pr-number 123 \
-  --fix
-```
-
-Use `--debug` to stream agent thinking as log lines:
+### 4. Run a review
 
 ```bash
-bun run src/main.ts \
-  --repository "owner/name" \
-  --pr-number 123 \
-  --debug
+bun run src/main.ts --repository "owner/name" --pr-number 123
 ```
 
-**Environment variables** (set in `agent/.env` or as job-level env in CI):
+The default is the full pipeline: parallel reviews, validity scoring, then development of fixes for accepted findings.
 
-| Name | Required | Description |
-|------|----------|-------------|
-| `GH_TOKEN` | yes | GitHub token (`repo` scope) for PR comments, fix branches |
-| `OPENROUTER_API_KEY` | yes | OpenRouter API key for LLM access |
-| `OPENROUTER_REVIEWER_MODEL` | yes | OpenRouter model reference used by the three review agents. |
-| `OPENROUTER_REFUTER_MODEL` | yes | Jev decision model via OpenRouter Decisions API (for example, `typesafe/jev-1.13`). |
-| `OPENROUTER_DEVELOPER_MODEL` | yes | OpenRouter model reference used by the fix agent. |
-| `OPENSANDBOX_MCP_URL` | no | MCP server URL (default: `http://localhost:8000/mcp`) |
-
-### 6. Run the books app locally
+Choose a mode with flags:
 
 ```bash
-cd app
-bun install --frozen-lockfile
-docker-compose up -d db        # Start PostgreSQL
-bun run src/main.ts            # Start Fastify on port 8000
+# Review and score findings; skip the developer
+bun run src/main.ts --repository "owner/name" --pr-number 123 --review
+
+# Skip review; apply findings from the latest Review Analysis comment
+bun run src/main.ts --repository "owner/name" --pr-number 123 --fix
+
+# Explicitly request the full pipeline (same as omitting both flags)
+bun run src/main.ts --repository "owner/name" --pr-number 123 --review --fix
 ```
 
-API endpoints:
-- `POST /api/books/` — Create a book
-- `GET /api/books/` — List all books
-- `GET /api/books/:id` — Get a book by ID
-- `PUT /api/books/:id` — Update a book
-- `DELETE /api/books/:id` — Delete a book
+`--fix` mode requires a prior swarm `Review Analysis` comment with an `## Accepted` section. It uses that section as the developer's input and does not minimize existing comments during that run. `--review` runs the three reviewers and the refuter, posts their comments, and skips fix development. The full and review-only modes attempt to minimize older swarm comments before starting; a failure to minimize is logged and the run continues.
 
-Run tests:
-```bash
-bun test
-```
-
-## GitHub CI (automated code review)
-
-The workflow in `.github/workflows/review-swarm.yml` triggers on PRs that modify `app/**`.
-
-```
-┌─────────────────┐
-│  pull_request   │
-│  opened/sync    │
-│  on app/**      │
-└────────┬────────┘
-         ▼
-┌──────────────────────────────┐
-│  jobs.review                 │
-│  ├─ Checkout repo            │
-│  ├─ Setup Bun 1.4             │
-│  ├─ pip install opensandbox   │
-│  │  (Python infrastructure)   │
-│  ├─ Start OpenSandbox         │
-│  ├─ bun install (agent)       │
-│  └─ bun run src/main.ts       │
-│     --repository owner/repo   │
-│     --pr-number N             │
-└──────────────────────────────┘
-         │
-         ▼
-┌─────────────────────────────────────────────────────┐
-│  Mastra Workflow (in the CLI script)                │
-│  1. Minimize old bot comments (GraphQL)             │
-│  2. Fetch PR context (Octokit REST API)             │
-│  3. .parallel() — 3 reviewers (concurrent:         │
-│     each creates own sandbox, runs linters/tests)   │
-│  4. .then() — score findings with Jev (no sandbox) │
-│  5. .then() — develop fix (own sandbox, git diff)  │
-│                                                     │
-│  As each step completes (streamed events),          │
-│  the CLI posts a PR comment:                        │
-│  🔒 Security  ⚡ Performance  🧹 Quality             │
-│  🎯 Summary  💻 Fix Applied (with sub-PR link)      │
-└─────────────────────────────────────────────────────┘
-```
-
-### GitHub repository configuration
-
-Before CI can run correctly, configure these in your GitHub repository:
-
-#### Secrets
-
-| Name | Description |
-|------|-------------|
-| `OPENROUTER_API_KEY` | Required. API key from [OpenRouter](https://openrouter.ai/keys). |
-| `GH_TOKEN` | Required. GitHub token with `repo` scope (read + push to fix branches). Name matches GitHub Secrets convention. |
-
-#### Variables
-
-| Name | Default | Description |
-|------|---------|-------------|
-| `OPENROUTER_REVIEWER_MODEL` | Required | OpenRouter model reference for all three review agents. |
-| `OPENROUTER_REFUTER_MODEL` | Required | Jev decision model for typed validity probabilities, such as `typesafe/jev-1.13`. |
-| `OPENROUTER_DEVELOPER_MODEL` | Required | OpenRouter model reference for fix development. |
-| `OPENSANDBOX_DOMAIN` | `localhost:8080` | Sandbox server address. |
-| `OPENSANDBOX_MCP_URL` | `http://localhost:8000/mcp` | MCP server URL. |
-
-#### Permissions
-
-The workflow sets the following permissions:
-
-```yaml
-permissions:
-  contents: write      # git push to create fix branches
-  pull-requests: write # create fix PRs and post comments
-```
-
-### Sandbox image
-
-The sandbox Docker image is **not built during CI** — it must be pre-built and pushed to GHCR before the workflow runs:
+Pass `--debug` to print model configuration and workflow event details:
 
 ```bash
-# Build and publish the sandbox image (replace <owner> with your GitHub username/org)
-docker build -t ghcr.io/<owner>/review-swarm-sandbox:latest -f sandbox/Dockerfile sandbox/
-docker push ghcr.io/<owner>/review-swarm-sandbox:latest
+bun run src/main.ts --repository "owner/name" --pr-number 123 --debug
 ```
 
-The agent's `OPENSANDBOX_IMAGE` env var (default: `review-swarm-sandbox:latest`) tells OpenSandbox which image to use when creating sandboxes.
+## Findings and comments
 
-## How the review swarm works
+Reviewers submit structured findings with these fields: severity (`HIGH`, `MEDIUM`, or `LOW`), title, file/line location, description, and suggestion. Mastra validates the data from the local `report_findings` tool. If an agent fails to call its report tool, the runner makes one constrained recovery call; if that also fails, it uses an empty findings list. Transient model/network failures are retried up to three times.
 
-1. **GitHub PR event** (opened or synchronize on `app/**`) → GitHub Actions triggers
-2. **CI setup**: Checkout → Setup Bun → Install OpenSandbox → Start OpenSandbox server + MCP server → `bun install` → `bun run src/main.ts`
-3. **CLI script starts** (`agent/src/main.ts`):
-   a. Minimizes old bot comments via GraphQL (`minimizeComment` with `OUTDATED` classifier)
-   b. Fetches PR context (title, diff, changed files) via Octokit REST API
-   c. Builds a task string with PR metadata
-4. **Mastra workflow starts**:
-   a. **3 parallel review steps** — each creates its own `MCPClient + Agent`, creates a sandbox, clones the repo, runs linters (`tsc --no-errors`, `eslint`, `prettier --check` for TS), analyzes code, returns **markdown** findings (no Zod schemas — plain text), then destroys its sandbox
-   b. When ALL 3 reviews complete, **refute step** sends each finding, PR context, and the PR diff to Jev through OpenRouter's Decisions API, then accepts findings with validity probability ≥75%
-   c. After refutation, **develop step** fires — creates its own `MCPClient + Agent`, creates a sandbox, implements fixes, generates a git diff, returns markdown with `## Summary`, `## Branch`, and `## Diff` sections
-5. **Event streaming**: As each step completes, the workflow streams `step-finished` events — the CLI script posts a PR comment via Octokit (🔒 Security, ⚡ Performance, 🧹 Quality, 🎯 Findings Summary, 💻 Fix Applied)
-6. **Developer step completion**: CLI script parses the developer's markdown output, creates a fix branch from the PR head, commits the diff via GitHub Contents API, and opens a sub-PR
-7. **Sandbox cleanup safety net**: Any remaining sandboxes destroyed
-8. Script exits with code 0
+The CLI streams completed workflow steps and posts comments as they finish:
 
-### Markdown output format
+- A reviewer comment for each reviewer that returns findings
+- A `Review Analysis` comment listing accepted and rejected findings with Jev probabilities
+- A `Fix Applied` comment after a real fix sub-PR has been created
 
-Agents return **plain markdown** — no Zod schemas for structured output. Each reviewer formats findings with severity as headings and items as numbered bullets:
+Comments include a hidden swarm marker so later review/full runs can identify and minimize earlier swarm comments. Findings are scored one at a time against the PR context and their relevant changed-file diff hunk.
 
-```markdown
-## HIGH
+## Sandbox behavior
 
-1. **SQL Injection Risk** — `src/db.ts:42` — Description of the issue. Fix: use parameterized queries.
+For each reviewer and developer task, the service:
 
-## MEDIUM
+1. Creates an isolated sandbox (1 CPU, 2 GiB memory, one-hour TTL by default).
+2. Starts the sandbox image's background services.
+3. Clones the repository and checks out the PR head branch.
+4. Runs `bun install` in `app/` when preparing the checkout. If installation fails, setup logs a warning and continues.
+5. Registers that sandbox with its own MCP client and gives the agent the sandbox's file/command tools.
+6. Disconnects and kills the sandbox when the agent finishes. A final cleanup handler also kills remaining sandboxes on errors and shutdown signals.
 
-1. **Connection pool not configured** — `src/db.ts:1` — Description...
-```
+The clone is public-URL based (`https://github.com/<owner>/<repo>.git`); private repositories need a clone setup that supplies credentials. The GitHub token is used for GitHub API calls and the fix push, but is not currently injected into the clone URL.
 
-The refuter posts a Review Analysis comment with each finding's Jev validity probability and accepted/rejected status:
+The reviewer prompts describe code inspection and checks, but the runner itself only guarantees dependency installation; it does not automatically invoke a fixed lint or test command. The agents choose which available inspection and command tools to use. `sandbox/Dockerfile` provides several language tools, while project-specific checks still depend on the repository and the agent's work.
 
-```markdown
-## Accepted
+## Repository layout
 
-1. HIGH — SQL Injection Risk — 92% validity probability — Reasoning...
-
-## Rejected
-
-1. MEDIUM — Unused variable — 24% validity probability — Out of scope for this PR...
-```
-
-The developer returns:
-
-```markdown
-## Summary
-Fixed SQL injection by using parameterized queries.
-
-## Branch
-fix/review-swarm-a1b2c3d4
-
-## Diff
-```diff
---- a/src/db.ts
-+++ b/src/db.ts
-@@ -42,7 +42,7 @@
--  const query = `SELECT * FROM users WHERE id = ${userId}`;
-+  const query = 'SELECT * FROM users WHERE id = $1';
-```
-```
+```text
+osbx-review-swarm/
+├── agent/
+│   ├── src/main.ts       # CLI, workflow, sandbox lifecycle, GitHub service layer
+│   ├── src/prompts.ts    # Reviewer and developer instructions
+│   └── .env.example      # Agent configuration template
+├── app/                  # Example Fastify books API repository content
+├── sandbox/
+│   ├── Dockerfile        # Runtime and analysis tools for agent sandboxes
+│   └── entrypoint.sh     # Initializes PostgreSQL in each sandbox
+└── README.md
 ```
 
 ## Technology stack
 
-| Layer | Technology |
-|-------|-----------|
-| Agent orchestration | [Mastra](https://mastra.ai) v1.63.0 |
-| Agent runtime | [Bun](https://bun.sh) 1.4 |
-| MCP integration | `@mastra/mcp` (MCPClient with `listTools()` / `cleanup()`) |
-| GitHub API | `@octokit/rest` + raw `fetch` (GraphQL for `minimizeComment`) |
-| App framework | [Fastify](https://fastify.dev) v5 |
-| App ORM | [Drizzle ORM](https://orm.drizzle.team) + `pg` (node-postgres) |
-| App validation | [Zod](https://zod.dev) (API request/response typing via `@fastify/type-provider-zod`) |
-| App testing | Bun built-in test runner |
-| LLM provider | OpenRouter (via Mastra magic string model IDs) |
-| Sandbox management | OpenSandbox (pip install — Python infrastructure only) |
-| Sandbox image | `oven/bun:1.4-alpine` with PostgreSQL + polyglot linters |
+| Area | Technology |
+|---|---|
+| Workflow and agents | [Mastra](https://mastra.ai) |
+| Runtime | [Bun](https://bun.sh) |
+| Sandbox lifecycle | [OpenSandbox](https://github.com/opensandbox-group/OpenSandbox) JavaScript SDK |
+| Sandbox tools | OpenSandbox MCP server |
+| GitHub operations | Octokit REST API and GitHub GraphQL API |
+| Review/development models | OpenRouter |
+| Finding validity | Jev Decisions API with typed Noul probabilities |
