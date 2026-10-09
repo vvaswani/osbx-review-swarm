@@ -1795,7 +1795,7 @@ async function handleStepCompletion(
     const titles: Record<string, string> = {
       security_review: 'Security Review',
       performance_review: 'Performance Review',
-      code_quality_review: 'Code Quality Review',
+      code_quality_review: 'Coding Standards Review',
     };
     const findings = extractStepResult<ReviewerOutput>(event);
     if (!findings || findings.findings.length === 0) {
