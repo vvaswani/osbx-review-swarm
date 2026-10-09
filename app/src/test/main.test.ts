@@ -24,9 +24,9 @@ async function createBookViaApi(app: FastifyInstance, book: { title: string; aut
 }
 
 const TEST_BOOKS = [
-  { title: 'Carrie', author: 'Stephen King' },
-  { title: 'Ready Player One', author: 'Ernest Cline' },
-  { title: 'The Shining', author: 'Stephen King' },
+  { title: 'Carrie', author: 'Stephen King', publisher: 'Publisher A' },
+  { title: 'Ready Player One', author: 'Ernest Cline', publisher: 'Publisher B' },
+  { title: 'The Shining', author: 'Stephen King', publisher: 'Publisher A' },
 ];
 
 describe('App', () => {
