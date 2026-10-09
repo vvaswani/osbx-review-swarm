@@ -21,6 +21,7 @@ export const books = pgTable('books', {
 export const BookInSchema = z.object({
   title: z.string().min(1, 'Title is required').max(255),
   author: z.string().min(1, 'Author is required').max(255),
+  publisher: z.string().min(1, 'Publisher is required').max(255),
 });
 
 export const BookOutSchema = BookInSchema.extend({
