@@ -40,7 +40,7 @@ export async function updateBook(
 ): Promise<typeof books.$inferSelect | undefined> {
   const [result] = await db
     .update(books)
-    .set({ title: book.title, author: book.author })
+    .set({ title: book.title, author: book.author, publisher: book.publisher })
     .where(eq(books.id, bookId))
     .returning();
   return result;
