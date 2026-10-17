@@ -438,19 +438,51 @@ async function postPrComment(repository: string, prNumber: number, body: string)
 /**
  * Commit changes in the sandbox via git and push to a new fix branch.
  *
- * Returns the fix branch name, or an empty string if there was nothing to commit.
+ * Returns the verified worktree diff/files and pushed branch, or null when
+ * the sandbox contains no changes.
  */
 async function gitCommitAndPush(
   sandbox: Sandbox,
   repository: string,
   fixBranch: string,
   prNumber: number,
-): Promise<string> {
+): Promise<{ branch: string; diff: string; changedFiles: string[] } | null> {
   const pushUrl = `https://${GITHUB_TOKEN}@github.com/${repository}.git`;
 
-  // Log git status so we can diagnose "no changes to commit" issues
-  const statusResult = await runCommandInSandbox(sandbox, 'git status --short', '/root/project');
+  // Verify the agent's report against the sandbox before staging anything.
+  // The structured report is model output and can claim a diff that was never
+  // applied; only the worktree diff is authoritative for the sub-PR.
+  const statusResult = await runCommandInSandbox(
+    sandbox,
+    'git status --short',
+    '/root/project',
+  );
+  if (statusResult.exit_code !== 0) {
+    throw new Error(`git status failed (exit ${statusResult.exit_code}): ${statusResult.stderr}`);
+  }
   console.log(`[gitCommitAndPush] git status:\n${statusResult.stdout || '(clean)'}`);
+
+  const diffResult = await runCommandInSandbox(
+    sandbox,
+    'git diff --no-ext-diff --binary HEAD',
+    '/root/project',
+  );
+  if (diffResult.exit_code !== 0) {
+    throw new Error(`git diff failed (exit ${diffResult.exit_code}): ${diffResult.stderr}`);
+  }
+  if (!diffResult.stdout.trim()) {
+    console.log('[gitCommitAndPush] Worktree diff is empty — skipping push and sub-PR creation');
+    return null;
+  }
+
+  const changedFilesResult = await runCommandInSandbox(
+    sandbox,
+    'git diff --name-only HEAD',
+    '/root/project',
+  );
+  if (changedFilesResult.exit_code !== 0) {
+    throw new Error(`git diff --name-only failed (exit ${changedFilesResult.exit_code}): ${changedFilesResult.stderr}`);
+  }
 
   const gitSteps: Array<[string, string]> = [
     ['git-config-email', 'git config user.email "fixer-agent@example.com"'],
@@ -465,7 +497,8 @@ async function gitCommitAndPush(
     // git commit returns exit code 1 when there's nothing to commit — that's OK
     if (name === 'git-commit' && result.exit_code === 1) {
       console.log('No changes to commit — skipping git push and sub-PR creation');
-      return '';
+      console.log('Git reported nothing to commit after the worktree diff check');
+      return null;
     }
     if (result.exit_code !== 0) {
       throw new Error(`git step ${name} failed (exit ${result.exit_code}): ${result.stderr}`);
@@ -480,7 +513,11 @@ async function gitCommitAndPush(
   }
 
   console.log(`Fix branch ${fixBranch} pushed to ${repository}`);
-  return fixBranch;
+  return {
+    branch: fixBranch,
+    diff: diffResult.stdout,
+    changedFiles: changedFilesResult.stdout.split('\n').filter(Boolean),
+  };
 }
 
 /**
@@ -1482,15 +1519,27 @@ async function runDeveloper(
       output.branch = `fix/review-swarm-${crypto.randomUUID().slice(0, 8)}`;
     }
     const fixBranch = output.branch;
-    const pushedBranch = await gitCommitAndPush(sandbox, repository, fixBranch, prNumber);
+    const pushed = await gitCommitAndPush(sandbox, repository, fixBranch, prNumber);
+
+    if (pushed) {
+      // Replace the agent's claimed output with the diff that Git verified in
+      // the sandbox. This is the exact change that will be included in the PR.
+      output.diff = pushed.diff;
+      output.changedFiles = pushed.changedFiles;
+      output.branch = pushed.branch;
+    } else {
+      output.diff = '';
+      output.changedFiles = [];
+      output.summary = 'No filesystem changes were made in the developer sandbox; no fix branch or sub-PR was created.';
+    }
 
     // Developer sandbox is no longer needed after commit+push — kill it
     // immediately to free resources (same reasoning as reviewer sandboxes).
     await killSandbox(sandbox);
     sandboxKilled = true;
 
-    if (pushedBranch) {
-      output.subPrUrl = await createFixBranchAndPr(repository, headRef, pushedBranch, output.summary);
+    if (pushed) {
+      output.subPrUrl = await createFixBranchAndPr(repository, headRef, pushed.branch, output.summary, prNumber);
     }
     console.log(`[runDeveloper] Fix applied in sandbox ${sandbox.id} — subPR: ${output.subPrUrl}`);
     return output;
