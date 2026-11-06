@@ -4,23 +4,24 @@
  * Replaces the original SQLAlchemy models (app/models.py) and Pydantic schemas.
  */
 
-import { pgTable, serial, varchar } from 'drizzle-orm/pg-core';
-import { z } from 'zod';
+import { pgTable, serial, varchar } from "drizzle-orm/pg-core";
+import { z } from "zod";
 
 // ── Drizzle table definition (SQLAlchemy equivalent) ─────────────────────────
 
-export const books = pgTable('books', {
-  id: serial('id').primaryKey(),
-  title: varchar('title', { length: 255 }).notNull(),
-  author: varchar('author', { length: 255 }).notNull(),
-  publisher: varchar('publisher', { length: 255 }).notNull(),
+export const books = pgTable("books", {
+  id: serial("id").primaryKey(),
+  title: varchar("title", { length: 255 }).notNull(),
+  author: varchar("author", { length: 255 }).notNull(),
+  publisher: varchar("publisher", { length: 255 }).notNull().default(""),
 });
 
 // ── Zod schemas for API validation (Pydantic equivalent) ──────────────────────
 
 export const BookInSchema = z.object({
-  title: z.string().min(1, 'Title is required').max(255),
-  author: z.string().min(1, 'Author is required').max(255),
+  title: z.string().min(1, "Title is required").max(255),
+  author: z.string().min(1, "Author is required").max(255),
+  publisher: z.string().max(255).default(""),
 });
 
 export const BookOutSchema = BookInSchema.extend({
