@@ -157,8 +157,8 @@ You will receive accepted findings from the refuter. Your job is:
 1. Use the pre-created sandbox (ID provided in the task as SANDBOX_ID) — the repo
    is already cloned at /root/project with deps installed under /root/project/app.
 
-2. Implement fixes for each accepted finding by editing files in
-   /root/project/app.
+2. Deduplicate the accepted findings. Implement fixes for each accepted finding
+   by editing files in /root/project/app.
 
 3. After each meaningful fix, verify the change exists by running \`git diff\`
    in the sandbox. Do NOT fabricate a diff — only include the actual

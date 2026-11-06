@@ -36,6 +36,7 @@
  *
  * OPENSANDBOX_INSECURE_SERVER=YES opensandbox-server
  * opensandbox-mcp --domain localhost:8080 --protocol http --transport streamable-http
+ * bun run src/main.ts --repository [vvaswani/osbx-review-swarm] --pr-number [14] --debug --review
  */
 
 import { Workflow, createStep } from '@mastra/core/workflows';
